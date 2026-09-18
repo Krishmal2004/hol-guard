@@ -6,8 +6,7 @@
     "canonical_diff_digest",
     "effective"
   ],
-  "catalog_digest": "120968d73c7f261013845baf9d73ad9fe922b1c10a35fbd28e3c6a9118f05e38",
-  "catalog_digest": "1d822cce55cbb8afcb6541ea96e70070b36047133249e52bde79c6b31f181901",
+  "catalog_digest": "4393091ccef5132be9971755272494815120311af314286717935e75a50c373c",
   "control_schema_version": "1.0.0",
   "daemon_api_schema": "guard.daemon.extension-controls.v1",
   "effective_shape": [
@@ -21,7 +20,7 @@
     "failures",
     "projection"
   ],
-  "extension_count": 71,
+  "extension_count": 72,
   "extension_ids": [
     "command.api-gateway",
     "command.backup.borg",
@@ -99,7 +98,7 @@
   "extension_schema_version": 2,
   "installed_browser_config": "dashboard/playwright.installed.config.ts",
   "overview_route": "/extensions",
-  "permission_count": 248,
+  "permission_count": 249,
   "permission_examples": {
     "command.api-gateway.permission.delete": "aws apigateway delete-rest-api",
     "command.backup.borg.permission.mutation": "borg delete",
