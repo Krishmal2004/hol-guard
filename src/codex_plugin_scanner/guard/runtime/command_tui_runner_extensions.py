@@ -10,18 +10,105 @@ for this extension. The one argv-level flag that changes behavior without furthe
 interactive confirmation is --reconfigure, which forces the setup wizard to run and
 unconditionally overwrites any existing tui.config.json for the chosen project once
 the wizard completes.
+
+Conservative matching covers:
+- Standard launcher variants: tui-runner, tui-runner.exe, tui-runner.cmd
+- Shell wrappers: exec tui-runner ..., xargs tui-runner ...
+- Unresolved shell expansions ($VAR, ${VAR}, $(...), backticks) that may supply
+  --reconfigure and so cannot be proven absent.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from .command_extension_matchers import executable_names
 from .command_extension_specs import CommandExtensionSpec
-from .command_rules import CommandSafetyRule, ExecutableMatcher
+from .command_matcher_contracts import MatcherEvidence
+from .command_model import CanonicalCommand
+from .command_rules import (
+    AnyMatcher,
+    CommandSafetyRule,
+    ExecutableMatcher,
+    _after_leading_options,
+    _segment_matches_executable,
+)
 
-_TUI_RUNNER_RECONFIGURE = ExecutableMatcher(
-    executables=executable_names("tui-runner"),
-    required_flags=frozenset({"--reconfigure"}),
-    required_flags_in_all_arguments=True,
+_TUI_RUNNER_LAUNCHERS: tuple[tuple[str, ...], ...] = (
+    ("tui-runner",),
+    ("exec", "tui-runner"),
+    ("xargs", "tui-runner"),
+)
+_WRAPPER_LEADING_OPTIONS_WITH_VALUES = frozenset({"-n", "-P", "-I", "-L", "-s"})
+_EXPANSION_MARKERS: frozenset[str] = frozenset({"$", "`"})
+
+
+def _tui_runner_launcher_matcher(launcher: tuple[str, ...]) -> ExecutableMatcher:
+    is_wrapper = launcher[0] in ("exec", "xargs")
+    return ExecutableMatcher(
+        executables=executable_names(launcher[0]),
+        subcommands=launcher[1:],
+        required_flags=frozenset({"--reconfigure"}),
+        required_flags_in_all_arguments=True,
+        allow_leading_options=is_wrapper,
+        leading_options_with_values=(_WRAPPER_LEADING_OPTIONS_WITH_VALUES if is_wrapper else frozenset()),
+    )
+
+
+_TUI_RUNNER_RECONFIGURE = AnyMatcher(
+    matchers=tuple(_tui_runner_launcher_matcher(launcher) for launcher in _TUI_RUNNER_LAUNCHERS)
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TuiRunnerUnresolvedExpansionMatcher:
+    """Match TUI Runner invocations whose flags may be supplied by shell expansion.
+
+    A `$VAR`, `${VAR}`, `$(...)`, or backtick token can expand to --reconfigure
+    at execution time, so its presence in a TUI Runner invocation means the
+    destructive flag cannot be proven absent.
+    """
+
+    launchers: tuple[tuple[str, ...], ...] = _TUI_RUNNER_LAUNCHERS
+    leading_options_with_values: frozenset[str] = _WRAPPER_LEADING_OPTIONS_WITH_VALUES
+    expansion_markers: frozenset[str] = _EXPANSION_MARKERS
+
+    def match(self, command: CanonicalCommand) -> tuple[MatcherEvidence, ...]:
+        evidence: list[MatcherEvidence] = []
+        for index, segment in enumerate(command.segments):
+            if segment.executable is None:
+                continue
+            lowered_arguments = tuple(argument.lower() for argument in segment.arguments)
+            for launcher in self.launchers:
+                if not _segment_matches_executable(segment, frozenset({launcher[0]})):
+                    continue
+                candidate_arguments = lowered_arguments
+                if launcher[0] in ("exec", "xargs"):
+                    candidate_arguments = _after_leading_options(
+                        candidate_arguments,
+                        self.leading_options_with_values,
+                        frozenset(),
+                    )
+                prefix = launcher[1:]
+                if candidate_arguments[: len(prefix)] != prefix:
+                    continue
+                remaining_arguments = candidate_arguments[len(prefix) :]
+                if any(
+                    any(marker in argument for marker in self.expansion_markers) for argument in remaining_arguments
+                ):
+                    evidence.append(
+                        MatcherEvidence(
+                            segment_index=index,
+                            executable=segment.executable,
+                            detail="Matched TUI Runner arguments that may expand to --reconfigure.",
+                        )
+                    )
+                break
+        return tuple(evidence)
+
+
+_TUI_RUNNER_RECONFIGURE_WITH_EXPANSIONS = AnyMatcher(
+    matchers=(*_TUI_RUNNER_RECONFIGURE.matchers, TuiRunnerUnresolvedExpansionMatcher()),
 )
 
 TUI_RUNNER_COMMAND_RULES = (
@@ -32,13 +119,15 @@ TUI_RUNNER_COMMAND_RULES = (
         description=(
             "Identifies TUI Runner invocations with --reconfigure, which forces the setup wizard to "
             "run and unconditionally overwrites any existing tui.config.json for the chosen project "
-            "once the wizard completes."
+            "once the wizard completes. Invocations carrying unresolved shell expansions are reviewed "
+            "because they cannot prove --reconfigure absent."
         ),
-        matcher=_TUI_RUNNER_RECONFIGURE,
+        matcher=_TUI_RUNNER_RECONFIGURE_WITH_EXPANSIONS,
         action_classes=("tui-runner forced reconfiguration command",),
         safer_alternatives=(
             "Inspect the project's existing tui.config.json before forcing --reconfigure, since the "
             "wizard replaces it without a separate confirmation step.",
+            "Expand shell variables and command substitutions before running tui-runner --reconfigure.",
         ),
         severity="medium",
         risk_classes=("destructive_shell",),
