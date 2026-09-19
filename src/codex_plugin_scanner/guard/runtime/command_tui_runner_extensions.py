@@ -80,7 +80,7 @@ class TuiRunnerUnresolvedExpansionMatcher:
                 continue
             lowered_arguments = tuple(argument.lower() for argument in segment.arguments)
             for launcher in self.launchers:
-                if not _segment_matches_executable(segment, frozenset({launcher[0]})):
+                if not _segment_matches_executable(segment, executable_names(launcher[0])):
                     continue
                 candidate_arguments = lowered_arguments
                 if launcher[0] in ("exec", "xargs"):
@@ -89,10 +89,12 @@ class TuiRunnerUnresolvedExpansionMatcher:
                         self.leading_options_with_values,
                         frozenset(),
                     )
-                prefix = launcher[1:]
-                if candidate_arguments[: len(prefix)] != prefix:
+                prefix_positions = tuple(executable_names(token) for token in launcher[1:])
+                if len(candidate_arguments) < len(prefix_positions) or any(
+                    candidate_arguments[position] not in names for position, names in enumerate(prefix_positions)
+                ):
                     continue
-                remaining_arguments = candidate_arguments[len(prefix) :]
+                remaining_arguments = candidate_arguments[len(prefix_positions) :]
                 if any(
                     any(marker in argument for marker in self.expansion_markers) for argument in remaining_arguments
                 ):

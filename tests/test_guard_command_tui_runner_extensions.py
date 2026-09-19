@@ -163,6 +163,12 @@ TUI_RUNNER_UNRESOLVED_EXPANSION_REVIEW_COMMANDS: tuple[str, ...] = (
     "tui-runner `echo --reconfigure`",
     "exec tui-runner $RECONFIG_FLAG",
     "xargs -n 1 tui-runner $RECONFIG_FLAG",
+    "tui-runner.exe $RECONFIG_FLAG",
+    "tui-runner.cmd $RECONFIG_FLAG",
+    "exec tui-runner.exe $RECONFIG_FLAG",
+    "exec tui-runner.cmd $RECONFIG_FLAG",
+    "xargs -n 1 tui-runner.exe $RECONFIG_FLAG",
+    "xargs -n 1 tui-runner.cmd $RECONFIG_FLAG",
 )
 
 
