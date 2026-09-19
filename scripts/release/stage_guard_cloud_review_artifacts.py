@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 
 _ARTIFACTS = {
+    "contracts/extensions/native-command-program.v1.json": "extensions/native-command-program.v1.json",
     "contracts/guard-cloud-review/v2/contract.json": "guard-cloud-review/v2/contract.json",
     "contracts/guard-cloud-review/v2/command-result.json": "guard-cloud-review/v2/command-result.json",
     "contracts/guard-cloud-review/v2/fixtures.json": "guard-cloud-review/v2/fixtures.json",
