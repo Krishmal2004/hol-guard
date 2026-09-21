@@ -1,10 +1,8 @@
-"""Risk classes for existing Guard command action classes."""
+"""Compatibility exports for command action risk metadata."""
 
 from __future__ import annotations
 
-from .command_blitcp_extensions import BLITCP_ACTION_RISK_CLASSES
-from .command_github_rules import GITHUB_ACTION_RISK_CLASSES
-from .command_ollama_extensions import OLLAMA_ACTION_RISK_CLASSES
+from .command_action_risk_metadata import COMMAND_ACTION_RISK_CLASSES
 
 COMMAND_ACTION_RISK_CLASSES: dict[str, tuple[str, ...]] = {
     "local secret read shell command": ("local_secret_read",),
@@ -74,3 +72,4 @@ COMMAND_ACTION_RISK_CLASSES: dict[str, tuple[str, ...]] = {
     **GITHUB_ACTION_RISK_CLASSES,
     **OLLAMA_ACTION_RISK_CLASSES,
 }
+__all__ = ["COMMAND_ACTION_RISK_CLASSES"]

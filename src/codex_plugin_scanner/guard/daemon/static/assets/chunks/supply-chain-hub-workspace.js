@@ -1,5 +1,5 @@
 const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/chunks/supply-chain-workspace.js","assets/guard-dashboard.js","assets/index.css","assets/chunks/feed-health-workspace.js","assets/chunks/home-protection-module.js","assets/chunks/supply-chain-protection-stats.js","assets/chunks/approval-proof-modal.js","assets/chunks/audit-workspace.js"])))=>i.map(i=>d[i]);
-import { br as isSupplyChainAuditIncomplete, bs as isSupplyChainAuditEvidence, b4 as GuardHarnessActionError, bt as readString$1, bu as isRecord$1, r as reactExports, j as jsxRuntimeExports, s as HiMiniCheckCircle, am as HiMiniArrowPath, P as HiMiniExclamationTriangle, aJ as Tag, y as formatRelativeTime, bv as HiMiniClock, bw as IconActionButton, a7 as HiMiniXCircle, b6 as HiMiniTrash, w as HiMiniShieldCheck, a3 as HiMiniWrenchScrewdriver, bx as HiMiniBeaker, by as ActivationSummary, bz as ActionResultPanel, aG as HiMiniMagnifyingGlass, n as EmptyState, A as ActionButton, bA as HiMiniBugAnt, C as HiMiniXMark, aP as buildApprovalProofCredentials, bB as GuardModalLayer, bC as ConnectFlowCard, bD as ApprovalProofInline, b1 as HiMiniArrowTopRightOnSquare, bE as HiMiniCloudArrowDown, aN as useResolvedApprovalGate, bF as fetchPackageFirewallStatus, bG as runPackageAudit, bH as resolveSupplyChainAuditFailure, bI as runPackageSync, bJ as startPackageFirewallConnect, a0 as openPackageFirewallAuthorizeFallback, bK as PACKAGE_FIREWALL_CONNECT_POPUP_BLOCKED_MESSAGE, bL as repairSupplyChainProtection, bM as runPackageFirewallAction, bN as parseInterceptProofSnapshot, bO as activatePackageFirewallRuntime, S as SectionLabel, bP as EntitlementNotice, bQ as fetchReceipts, aF as WorkspacePageHeader, bR as lazyWorkspace, bS as __vitePreload } from "../guard-dashboard.js";
+import { br as isSupplyChainAuditIncomplete, bs as isSupplyChainAuditEvidence, b4 as GuardHarnessActionError, bt as readString$1, bu as isRecord$1, r as reactExports, j as jsxRuntimeExports, s as HiMiniCheckCircle, am as HiMiniArrowPath, P as HiMiniExclamationTriangle, aJ as Tag, y as formatRelativeTime, bv as HiMiniClock, bw as IconActionButton, a7 as HiMiniXCircle, b6 as HiMiniTrash, w as HiMiniShieldCheck, a3 as HiMiniWrenchScrewdriver, bx as HiMiniBeaker, by as ActivationSummary, bz as ActionResultPanel, aG as HiMiniMagnifyingGlass, n as EmptyState, A as ActionButton, bA as HiMiniBugAnt, C as HiMiniXMark, aQ as buildApprovalProofCredentials, bB as GuardModalLayer, bC as ConnectFlowCard, bD as ApprovalProofInline, b1 as HiMiniArrowTopRightOnSquare, bE as HiMiniCloudArrowDown, aO as useResolvedApprovalGate, bF as fetchPackageFirewallStatus, bG as runPackageAudit, bH as resolveSupplyChainAuditFailure, bI as runPackageSync, bJ as startPackageFirewallConnect, a0 as openPackageFirewallAuthorizeFallback, bK as PACKAGE_FIREWALL_CONNECT_POPUP_BLOCKED_MESSAGE, bL as repairSupplyChainProtection, bM as runPackageFirewallAction, bN as parseInterceptProofSnapshot, bO as activatePackageFirewallRuntime, S as SectionLabel, bP as EntitlementNotice, bQ as fetchReceipts, aF as WorkspacePageHeader, bR as lazyWorkspace, bS as __vitePreload } from "../guard-dashboard.js";
 import { A as ApprovalProofModal } from "./approval-proof-modal.js";
 const SEVERITY_RANK = {
   critical: 4,
@@ -651,10 +651,19 @@ function supplyChainAuditConnectUserMessage(error) {
   }
   return "Sign in to HOL Guard Cloud on this machine, then run the workspace audit.";
 }
+function isSupplyChainAuditWorkspaceRequiredError(error) {
+  return error instanceof GuardHarnessActionError && error.payload?.error === "workspace_dir_required";
+}
+function isSupplyChainAuditWorkspaceInvalidError(error) {
+  return error instanceof GuardHarnessActionError && error.payload?.error === "workspace_dir_invalid";
+}
 function supplyChainAuditUserMessage(error) {
   if (error instanceof GuardHarnessActionError) {
-    if (error.payload?.error === "workspace_dir_required") {
-      return "Open Guard from the project you want to audit, or run `hol-guard supply-chain audit --json` from that project folder. The folder must contain a supported package manifest or lockfile.";
+    if (isSupplyChainAuditWorkspaceRequiredError(error)) {
+      return "Enter the project folder to audit below, then run the audit again. Or run `hol-guard supply-chain audit --json` from that project folder.";
+    }
+    if (isSupplyChainAuditWorkspaceInvalidError(error)) {
+      return "Guard could not use that project folder. Choose an existing local folder and run the audit again.";
     }
     return supplyChainAuditConnectUserMessage(error);
   }
@@ -679,6 +688,10 @@ function resolveSupplyChainAuditWorkspaceDir(managedInstalls) {
   return null;
 }
 function resolveSupplyChainAuditWorkspaceTarget(input) {
+  const selected = input.selectedWorkspaceDir?.trim();
+  if (selected) {
+    return selected;
+  }
   const managed = input.managedWorkspaceDir?.trim();
   if (managed) {
     return managed;
@@ -1584,8 +1597,10 @@ const PackageFirewallPanel = reactExports.forwardRef(function PackageFirewallPan
   const {
     approvalGate,
     auditWorkspaceDir,
+    managedAuditWorkspaceDir,
     onAuditConnectGateChange,
     onAuditErrorChange,
+    onAuditWorkspaceRequired,
     onStateChanged,
     onAuditCompleted,
     onAuditStarted,
@@ -1692,7 +1707,8 @@ const PackageFirewallPanel = reactExports.forwardRef(function PackageFirewallPan
       onAuditRunningChange?.(true);
       const statusWorkspaceDir = panelLoad.phase === "loaded" ? panelLoad.data.audit_workspace_dir ?? null : null;
       const workspaceDir = resolveSupplyChainAuditWorkspaceTarget({
-        managedWorkspaceDir: auditWorkspaceDir,
+        selectedWorkspaceDir: auditWorkspaceDir,
+        managedWorkspaceDir: managedAuditWorkspaceDir,
         statusWorkspaceDir
       });
       try {
@@ -1731,6 +1747,9 @@ const PackageFirewallPanel = reactExports.forwardRef(function PackageFirewallPan
           openAuditConnectGate(true);
           return false;
         }
+        if (isSupplyChainAuditWorkspaceRequiredError(err)) {
+          onAuditWorkspaceRequired?.();
+        }
         const message = supplyChainAuditUserMessage(err) ?? "Operation failed.";
         setLastFailed({ op: "audit", manager: null, message });
         onAuditErrorChange?.(message);
@@ -1749,9 +1768,11 @@ const PackageFirewallPanel = reactExports.forwardRef(function PackageFirewallPan
       onAuditCompleted,
       onAuditStarted,
       onAuditErrorChange,
+      onAuditWorkspaceRequired,
       onAuditRunningChange,
       onStateChanged,
       openAuditConnectGate,
+      managedAuditWorkspaceDir,
       panelLoad,
       refreshAfterOp
     ]
@@ -2365,6 +2386,8 @@ function useSupplyChainAuditSession({
   const [auditSnapshot, setAuditSnapshot] = reactExports.useState(null);
   const [auditRunning, setAuditRunning] = reactExports.useState(false);
   const [auditError, setAuditError] = reactExports.useState(null);
+  const [auditWorkspaceDir, setAuditWorkspaceDir] = reactExports.useState("");
+  const [auditWorkspaceSelectionRequired, setAuditWorkspaceSelectionRequired] = reactExports.useState(false);
   const [auditConnectGate, setAuditConnectGate] = reactExports.useState(null);
   const [auditPhase, setAuditPhase] = reactExports.useState("idle");
   const runAuditRef = reactExports.useRef(null);
@@ -2447,6 +2470,9 @@ function useSupplyChainAuditSession({
     },
     [clearPhaseTimers, setAuditPhaseLive]
   );
+  const handleAuditWorkspaceRequired = reactExports.useCallback(() => {
+    setAuditWorkspaceSelectionRequired(true);
+  }, []);
   const handleAuditRunningChange = reactExports.useCallback(
     (running) => {
       setAuditRunning(running);
@@ -2464,6 +2490,8 @@ function useSupplyChainAuditSession({
     auditSnapshot,
     auditRunning,
     auditError,
+    auditWorkspaceDir,
+    auditWorkspaceSelectionRequired,
     auditConnectGate,
     auditPhase,
     runAuditRef,
@@ -2471,6 +2499,8 @@ function useSupplyChainAuditSession({
     handleAuditStarted,
     handleAuditCompleted,
     handleAuditErrorChange,
+    handleAuditWorkspaceRequired,
+    setAuditWorkspaceDir,
     handleAuditRunningChange,
     handleRunAudit
   };
@@ -2511,7 +2541,7 @@ function SupplyChainHubWorkspace(props) {
     snapshot: props.snapshot,
     onNavigate: props.onNavigate
   });
-  const auditWorkspaceDir = reactExports.useMemo(
+  const managedAuditWorkspaceDir = reactExports.useMemo(
     () => resolveSupplyChainAuditWorkspaceDir(props.snapshot.managed_installs ?? []),
     [props.snapshot.managed_installs]
   );
@@ -2565,9 +2595,11 @@ function SupplyChainHubWorkspace(props) {
       {
         ref: firewallPanelRef,
         approvalGate: props.approvalGate,
-        auditWorkspaceDir,
+        auditWorkspaceDir: auditSession.auditWorkspaceDir,
+        managedAuditWorkspaceDir,
         onAuditConnectGateChange: auditSession.setAuditConnectGate,
         onAuditErrorChange: auditSession.handleAuditErrorChange,
+        onAuditWorkspaceRequired: auditSession.handleAuditWorkspaceRequired,
         onStateChanged: props.onRuntimeRefresh,
         onAuditStarted: auditSession.handleAuditStarted,
         onAuditCompleted: auditSession.handleAuditCompleted,
