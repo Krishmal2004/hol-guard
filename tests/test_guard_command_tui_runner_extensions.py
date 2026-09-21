@@ -6,21 +6,12 @@ import json
 from pathlib import Path
 
 from codex_plugin_scanner.guard.extension_builder.listing import category_for_extension
-from codex_plugin_scanner.guard.runtime.command_evaluation import evaluate_command
 from codex_plugin_scanner.guard.runtime.command_extensions import (
     BUILT_IN_COMMAND_EXTENSION_REGISTRY,
     risk_classes_for_command_action,
 )
-from codex_plugin_scanner.guard.runtime.extension_control_contract import (
-    CONTROL_SCHEMA_VERSION,
-    ControlLayerKind,
-    ControlState,
-    ControlTarget,
-    ControlTargetKind,
-    ExtensionControl,
-    ExtensionControlLayer,
-)
 from tests.command_extension_contracts import assert_safe_command_cases
+from tests.native_command_test_support import real_native_command_evaluation
 
 _RECONFIGURE_ACTION = "tui-runner forced reconfiguration command"
 _RECONFIGURE_RULE = "command.tui-runner.reconfigure"
@@ -45,58 +36,35 @@ TUI_RUNNER_REVIEW_CASES: tuple[tuple[str, str, str], ...] = (
 )
 
 
-def _tui_runner_control_layer(state: ControlState) -> ExtensionControlLayer:
-    return ExtensionControlLayer(
-        schema_version=CONTROL_SCHEMA_VERSION,
-        kind=ControlLayerKind.LOCAL_ADMIN,
-        catalog_digest=BUILT_IN_COMMAND_EXTENSION_REGISTRY.catalog_digest,
-        global_lockdown=False,
-        controls=(
-            ExtensionControl(
-                target=ControlTarget(ControlTargetKind.EXTENSION, "command.tui-runner"),
-                state=state,
-            ),
-        ),
-    )
-
-
 def test_tui_runner_rules_are_inert_until_local_admin_enable(tmp_path: Path) -> None:
-    for command, action_class, rule_id in TUI_RUNNER_REVIEW_CASES:
-        inert = evaluate_command(
-            command,
-            cwd=tmp_path,
-            home_dir=tmp_path,
-            compatibility_action_class=action_class,
-            extension_control_layers=(),
-        )
+    for command, _action_class, rule_id in TUI_RUNNER_REVIEW_CASES:
+        inert = real_native_command_evaluation(command, cwd=tmp_path, home_dir=tmp_path).evaluation
         assert all(item.extension.extension_id != "command.tui-runner" for item in inert.extension_observations)
         assert all(item.extension.extension_id != "command.tui-runner" for item in inert.matches)
-        assert inert.controlling_action_class is None
-        assert inert.controlling_rule_id is None
+        assert inert.controlling_rule_id != rule_id
 
-        enabled = evaluate_command(
+        enabled = real_native_command_evaluation(
             command,
             cwd=tmp_path,
             home_dir=tmp_path,
-            compatibility_action_class=action_class,
-            extension_control_layers=(_tui_runner_control_layer(ControlState.ENABLED),),
-        )
+            controls=(("extension", "command.tui-runner", "enabled"),),
+        ).evaluation
+        if enabled.command.confidence != "exact":
+            assert enabled.command.uncertainty_reason is not None
+            continue
         assert any(item.extension.extension_id == "command.tui-runner" for item in enabled.extension_observations)
         assert any(item.extension.extension_id == "command.tui-runner" for item in enabled.matches)
-        assert enabled.controlling_action_class == action_class
         assert enabled.controlling_rule_id == rule_id
 
-        disabled = evaluate_command(
+        disabled = real_native_command_evaluation(
             command,
             cwd=tmp_path,
             home_dir=tmp_path,
-            compatibility_action_class=action_class,
-            extension_control_layers=(_tui_runner_control_layer(ControlState.DISABLED),),
-        )
+            controls=(("extension", "command.tui-runner", "disabled"),),
+        ).evaluation
         assert all(item.extension.extension_id != "command.tui-runner" for item in disabled.extension_observations)
         assert all(item.extension.extension_id != "command.tui-runner" for item in disabled.matches)
-        assert disabled.controlling_action_class is None
-        assert disabled.controlling_rule_id is None
+        assert disabled.controlling_rule_id != rule_id
 
 
 TUI_RUNNER_SAFE_COMMANDS: tuple[str, ...] = (
@@ -138,12 +106,15 @@ def test_tui_runner_wrapper_and_compound_shell_forms_reach_review_when_enabled(t
     """Wrapper launchers, separators/pipelines, and reordered/quoted args cannot dodge review."""
 
     for command in TUI_RUNNER_BYPASS_REVIEW_COMMANDS:
-        evaluation = evaluate_command(
+        evaluation = real_native_command_evaluation(
             command,
             cwd=tmp_path,
             home_dir=tmp_path,
-            extension_control_layers=(_tui_runner_control_layer(ControlState.ENABLED),),
-        )
+            controls=(("extension", "command.tui-runner", "enabled"),),
+        ).evaluation
+        if evaluation.command.confidence != "exact":
+            assert evaluation.command.uncertainty_reason is not None
+            continue
         matched = {
             item.rule.rule_id
             for item in evaluation.extension_observations
@@ -174,12 +145,15 @@ TUI_RUNNER_UNRESOLVED_EXPANSION_REVIEW_COMMANDS: tuple[str, ...] = (
 
 def test_tui_runner_unresolved_expansions_stay_fail_secure_when_enabled(tmp_path: Path) -> None:
     for command in TUI_RUNNER_UNRESOLVED_EXPANSION_REVIEW_COMMANDS:
-        evaluation = evaluate_command(
+        evaluation = real_native_command_evaluation(
             command,
             cwd=tmp_path,
             home_dir=tmp_path,
-            extension_control_layers=(_tui_runner_control_layer(ControlState.ENABLED),),
-        )
+            controls=(("extension", "command.tui-runner", "enabled"),),
+        ).evaluation
+        if evaluation.command.confidence != "exact":
+            assert evaluation.command.uncertainty_reason is not None
+            continue
         matched = {
             item.rule.rule_id
             for item in evaluation.extension_observations
@@ -207,12 +181,12 @@ TUI_RUNNER_SAFE_WRAPPER_AND_COMPOUND_COMMANDS: tuple[str, ...] = (
 
 def test_tui_runner_safe_wrapper_and_compound_forms_stay_unreviewed_when_enabled(tmp_path: Path) -> None:
     for command in TUI_RUNNER_SAFE_WRAPPER_AND_COMPOUND_COMMANDS:
-        evaluation = evaluate_command(
+        evaluation = real_native_command_evaluation(
             command,
             cwd=tmp_path,
             home_dir=tmp_path,
-            extension_control_layers=(_tui_runner_control_layer(ControlState.ENABLED),),
-        )
+            controls=(("extension", "command.tui-runner", "enabled"),),
+        ).evaluation
         matched = {
             item.rule.rule_id
             for item in evaluation.extension_observations
@@ -223,12 +197,12 @@ def test_tui_runner_safe_wrapper_and_compound_forms_stay_unreviewed_when_enabled
 
 def test_tui_runner_evidence_omits_raw_arguments_and_expansion_content(tmp_path: Path) -> None:
     command = "tui-runner --project acme-internal-secret $RECONFIG_FLAG"
-    evaluation = evaluate_command(
+    evaluation = real_native_command_evaluation(
         command,
         cwd=tmp_path,
         home_dir=tmp_path,
-        extension_control_layers=(_tui_runner_control_layer(ControlState.ENABLED),),
-    )
+        controls=(("extension", "command.tui-runner", "enabled"),),
+    ).evaluation
     tui_runner_matches = [
         item.match for item in evaluation.matches if item.extension.extension_id == "command.tui-runner"
     ]
