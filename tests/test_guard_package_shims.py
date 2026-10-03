@@ -545,7 +545,12 @@ def test_guard_protect_does_not_prime_policy_integrity_or_hold_sqlite_writer(tmp
     _run_guard_protect_command(str(home_dir), str(workspace_dir), result_queue=fast_results)
     fast_result = fast_results.get(timeout=1)
 
-    slow_process.join(timeout=20)
+    slow_process.join(timeout=60)
+    if slow_process.exitcode is None:
+        # A wedged non-daemon child keeps the pytest process alive past the job
+        # timeout and reports "cancelled" instead of the real assertion.
+        slow_process.terminate()
+        slow_process.join(timeout=5)
     assert slow_process.exitcode == 0
     slow_result = slow_results.get(timeout=1)
 
@@ -678,8 +683,15 @@ def test_guard_protect_requires_reapproval_for_untrusted_package_sources_without
     assert payload["verdict"]["action"] == expected_action
 
 
-def test_package_manager_shim_runs_allowed_command_once_when_shim_dir_is_on_path(tmp_path: Path, capsys) -> None:
+def test_package_manager_shim_runs_allowed_command_once_when_shim_dir_is_on_path(
+    tmp_path: Path,
+    capsys,
+    native_hook_force: Path,
+) -> None:
+    from codex_plugin_scanner.guard.native_policy_snapshot import provision_native_policy_verifier_key
+
     home_dir = tmp_path / "guard-home"
+    provision_native_policy_verifier_key(home_dir, b"\x07" * 32)
     workspace_dir = tmp_path / "workspace"
     workspace_dir.mkdir(parents=True, exist_ok=True)
     fake_bin = tmp_path / "fake-bin"
@@ -898,9 +910,7 @@ def _generated_shim_with_fake_guard(context: HarnessContext, child_code: str) ->
     base_command_line = next(line for line in source.splitlines() if line.startswith("base_command = "))
     fake_command = [sys.executable, "-c", child_code]
     source = source.replace(base_command_line, f"base_command = {fake_command!r}", 1)
-    contained_start = source.index(
-        "try:\n    from codex_plugin_scanner.guard.contained_package_script_execution"
-    )
+    contained_start = source.index("try:\n    from codex_plugin_scanner.guard.contained_package_script_execution")
     guard_env_start = source.index("guard_env = dict(os.environ)", contained_start)
     return source[:contained_start] + "contained_result = None\n" + source[guard_env_start:]
 
@@ -1075,6 +1085,48 @@ _BLOCKING_SHIM_CASES = (
     ("composer", ("require", "monolog/monolog:3.6.0"), "packagist", "monolog/monolog", "3.6.0"),
     ("bundle", ("add", "rails", "--version", "7.1.3"), "rubygems", "rails", "7.1.3"),
 )
+
+
+def test_machine_wide_package_shim_uses_current_workspace_across_dashboard_contexts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home_dir = tmp_path / "home"
+    first_workspace = tmp_path / "first-workspace"
+    second_workspace = tmp_path / "second-workspace"
+    home_dir.mkdir()
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    frozen_exe = tmp_path / "core" / "current-hol-guard"
+    frozen_exe.parent.mkdir()
+    frozen_exe.write_text("", encoding="utf-8")
+    frozen_exe.chmod(0o755)
+    monkeypatch.setattr(guard_shims_module.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(guard_shims_module.sys, "executable", str(frozen_exe))
+    monkeypatch.setenv("SHELL", "/bin/bash")
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+    monkeypatch.setattr(guard_shims_module, "_is_transient_path", lambda _path: False)
+    guard_home = home_dir / ".hol-guard"
+    first_context = HarnessContext(home_dir=home_dir, guard_home=guard_home, workspace_dir=first_workspace)
+    second_context = HarnessContext(home_dir=home_dir, guard_home=guard_home, workspace_dir=second_workspace)
+
+    install_package_shims(first_context, managers=("npm",))
+    guard_shims_module.ensure_package_shim_path_in_shell_profile(first_context)
+
+    for context in (first_context, second_context):
+        status = package_shim_status(context)
+        npm = next(item for item in status["manager_details"] if item["manager"] == "npm")
+        assert npm["integrity"] == "ok"
+    shim_dir = guard_home / "package-shims" / "bin"
+    source_path = shim_dir / ".npm.py"
+    if not source_path.exists():
+        source_path = shim_dir / "npm"
+    source = source_path.read_text(encoding="utf-8")
+    assert "guard_workspace = None" in source
+    assert "guard_has_explicit_workspace = False" in source
+    assert "--workspace" not in next(line for line in source.splitlines() if line.startswith("base_command = "))
+    dashboard_status = guard_shims_module.package_shim_dashboard_status(second_context)
+    assert dashboard_status["path_status"] == "in_path"
+    assert dashboard_status["path_broken_managers"] == []
 
 
 def test_guard_package_shims_install_status_uninstall_roundtrip(tmp_path: Path, capsys) -> None:
@@ -1593,8 +1645,15 @@ def test_package_shim_tries_owned_containment_before_guard_review(tmp_path: Path
     assert "except Exception:\n        contained_result = None" in shim_source
 
 
-def test_guard_package_shim_preserves_argv_cwd_env_exitcode_and_stdio(tmp_path: Path, capsys) -> None:
+def test_guard_package_shim_preserves_argv_cwd_env_exitcode_and_stdio(
+    tmp_path: Path,
+    capsys,
+    native_hook_force: Path,
+) -> None:
+    from codex_plugin_scanner.guard.native_policy_snapshot import provision_native_policy_verifier_key
+
     home_dir = tmp_path / "guard-home"
+    provision_native_policy_verifier_key(home_dir, b"\x07" * 32)
     workspace_dir = tmp_path / "workspace"
     workspace_dir.mkdir(parents=True, exist_ok=True)
     fake_bin = tmp_path / "fake-bin"
@@ -1900,6 +1959,7 @@ def test_guard_protect_pnpm_install_alias_renders_wrapped_review_link_for_cloud_
     assert "http://127.0.0.1:5474/requests/" not in output
 
 
+@pytest.mark.usefixtures("approval_questionnaire_mode")
 def test_guard_protect_ignores_stale_policy_bundle_package_family_block(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2880,6 +2940,7 @@ def test_guard_protect_saved_allow_never_lowers_current_cached_advisory_block(
         and reason.get("code")
         in {
             "approval_reuse_current_block",
+            "approval_reuse_content_changed",
             "approval_reuse_policy_changed",
             "approval_reuse_reapproval_required",
             "approval_reuse_claim_failed",
@@ -3010,6 +3071,7 @@ def test_guard_protect_reloads_cached_advisory_authority_after_atomic_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     install_fake_system_keyring,
+    native_context_digest: Path,
 ) -> None:
     install_fake_system_keyring()
     home_dir = tmp_path / "guard-home"

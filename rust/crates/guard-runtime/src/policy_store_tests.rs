@@ -15,7 +15,6 @@ use guard_policy_snapshot::{
     POLICY_SNAPSHOT_PUSH_SCHEMA, POLICY_SNAPSHOT_SCHEMA,
 };
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -36,24 +35,7 @@ mod fixture_tests;
 #[path = "policy_store_migration_tests.rs"]
 mod migration_tests;
 
-fn policy() -> EffectiveNativePolicyV3 {
-    EffectiveNativePolicyV3 {
-        protection_posture: "protected".into(),
-        security_level: "balanced".into(),
-        default_action: "warn".into(),
-        unknown_publisher_action: "review".into(),
-        changed_hash_action: "require-reapproval".into(),
-        new_network_domain_action: "warn".into(),
-        subprocess_action: "warn".into(),
-        risk_actions: BTreeMap::new(),
-        harness_risk_actions: BTreeMap::new(),
-        harness_actions: BTreeMap::new(),
-        publisher_actions: BTreeMap::new(),
-        artifact_actions: BTreeMap::new(),
-        sandbox_analysis: "off".into(),
-        receipt_redaction_level: "full".into(),
-    }
-}
+use fixture_tests::policy;
 
 fn policy_with_default(default_action: &str) -> EffectiveNativePolicyV3 {
     let mut value = policy();
@@ -359,6 +341,8 @@ fn restarted_resident_applies_installed_policy_without_request_time_io() {
     let result: GuardHookEdgeResultV2 = serde_json::from_slice(&result).unwrap();
     assert_eq!(result.result["minimum_action"], "block");
     assert_eq!(result.result["authority"], "rust");
+    assert!(result.receipt.origin_authentication.is_some());
+    crate::policy_store::native_review_origin::verify(&restarted, &result.receipt).unwrap();
     fs::remove_dir_all(root).unwrap();
 }
 

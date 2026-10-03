@@ -1,9 +1,12 @@
-use super::sensitive_path_argument;
+use super::sensitive_read_path_argument as sensitive_path_argument;
 use glob_class::glob_class_matches;
 use std::collections::{HashSet, VecDeque};
 mod glob_class;
+mod grep;
 mod hint;
 mod options;
+mod tree;
+use options::unsafe_search_value;
 fn glob_matches(pattern: &[u8], value: &[u8]) -> bool {
     let mut previous = vec![false; value.len() + 1];
     previous[0] = true;
@@ -187,7 +190,7 @@ fn expand_brace_globs(pattern: &str) -> Option<Vec<String>> {
     }
     None
 }
-fn glob_can_select_sensitive_path(value: &str) -> bool {
+pub(super) fn glob_can_select_sensitive_path(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
     if normalized.len() > 512
         || normalized
@@ -227,6 +230,20 @@ fn glob_can_select_sensitive_path(value: &str) -> bool {
     patterns.iter().any(|pattern| {
         pattern.split('/').any(|component| {
             let bytes = component.as_bytes();
+            let code_extension = component
+                .rsplit_once('.')
+                .is_some_and(|(_, extension)| guard_secure_fs::is_source_code_extension(extension));
+            if !code_extension
+                && guard_secure_fs::credential_path_markers()
+                    .iter()
+                    .any(|marker| {
+                        glob_matches(bytes, marker.as_bytes())
+                            || glob_intersects_prefix_family(bytes, format!("{marker}.").as_bytes())
+                            || glob_intersects_contains_family(bytes, marker.as_bytes(), true)
+                    })
+            {
+                return true;
+            }
             let env_hint = hint::glob_constrained_lcs(bytes, b".env.") >= 2;
             let family_hint = [
                 b"private-key".as_slice(),
@@ -261,22 +278,12 @@ enum SearchValueRole {
     DirectoryAction,
     Other,
 }
-fn unsafe_search_value(role: SearchValueRole, value: &str) -> bool {
-    match role {
-        SearchValueRole::Glob | SearchValueRole::Path => {
-            sensitive_path_argument(value) || glob_can_select_sensitive_path(value)
-        }
-        SearchValueRole::TypeGlob => value.split_once(':').is_none_or(|(_, glob)| {
-            sensitive_path_argument(glob) || glob_can_select_sensitive_path(glob)
-        }),
-        SearchValueRole::DirectoryAction => value.eq_ignore_ascii_case("recurse"),
-        SearchValueRole::Pattern | SearchValueRole::Other => false,
-    }
-}
+type ReadContext<'a> = (Option<&'a str>, Option<&'a str>);
 fn short_search_option(
     argument: &str,
     dangerous: &[char],
     value_options: &[(char, SearchValueRole)],
+    context: ReadContext<'_>,
 ) -> Result<(Option<SearchValueRole>, bool), ()> {
     for (offset, option) in argument[1..].char_indices() {
         if dangerous.contains(&option) {
@@ -285,7 +292,7 @@ fn short_search_option(
         if let Some((_, role)) = value_options.iter().find(|(name, _)| *name == option) {
             let value_start = offset + option.len_utf8();
             let attached = &argument[1 + value_start..];
-            if !attached.is_empty() && unsafe_search_value(*role, attached) {
+            if !attached.is_empty() && unsafe_search_value(*role, attached, context) {
                 return Err(());
             }
             return Ok((
@@ -297,22 +304,26 @@ fn short_search_option(
     Ok((None, false))
 }
 
-pub(super) fn safe_search_arguments(executable: &str, arguments: &[String]) -> bool {
+pub(super) fn safe_search_arguments_with_context(
+    executable: &str,
+    arguments: &[String],
+    context: ReadContext<'_>,
+) -> bool {
     match executable {
-        "rg" => safe_rg_arguments(arguments),
-        "grep" => safe_grep_arguments(arguments),
+        "rg" => safe_rg_arguments(arguments, context),
+        "grep" => grep::safe_grep_arguments(arguments, context),
         _ => false,
     }
 }
 
-fn safe_rg_arguments(arguments: &[String]) -> bool {
+fn safe_rg_arguments(arguments: &[String], context: ReadContext<'_>) -> bool {
     let mut pending_value: Option<SearchValueRole> = None;
     let mut pattern_supplied = false;
     let mut options_enabled = true;
     let mut paths_only = false;
     for argument in arguments {
         if let Some(role) = pending_value.take() {
-            if unsafe_search_value(role, argument) {
+            if unsafe_search_value(role, argument, context) {
                 return false;
             }
             if matches!(role, SearchValueRole::Pattern) {
@@ -354,7 +365,7 @@ fn safe_rg_arguments(arguments: &[String]) -> bool {
             if let Some(role) = role {
                 if attached.is_empty() {
                     pending_value = Some(role);
-                } else if unsafe_search_value(role, attached) {
+                } else if unsafe_search_value(role, attached, context) {
                     return false;
                 } else if matches!(role, SearchValueRole::Pattern) {
                     pattern_supplied = true;
@@ -381,6 +392,7 @@ fn safe_rg_arguments(arguments: &[String]) -> bool {
                     ('t', SearchValueRole::Other),
                     ('T', SearchValueRole::Other),
                 ],
+                context,
             );
             let Ok((next_value, supplied_pattern)) = parsed else {
                 return false;
@@ -390,80 +402,9 @@ fn safe_rg_arguments(arguments: &[String]) -> bool {
             continue;
         }
         if paths_only || pattern_supplied {
-            if sensitive_path_argument(argument) || glob_can_select_sensitive_path(argument) {
-                return false;
-            }
-        } else {
-            pattern_supplied = true;
-        }
-    }
-    pending_value.is_none()
-}
-
-fn safe_grep_arguments(arguments: &[String]) -> bool {
-    let mut pending_value: Option<SearchValueRole> = None;
-    let mut pattern_supplied = false;
-    let mut options_enabled = true;
-    for argument in arguments {
-        if let Some(role) = pending_value.take() {
-            if unsafe_search_value(role, argument) {
-                return false;
-            }
-            if matches!(role, SearchValueRole::Pattern) {
-                pattern_supplied = true;
-            }
-            continue;
-        }
-        if options_enabled && argument == "--" {
-            options_enabled = false;
-            continue;
-        }
-        if options_enabled && argument.starts_with("--") {
-            let (name, attached) = argument.split_once('=').unwrap_or((argument.as_str(), ""));
-            if matches!(
-                name,
-                "--recursive" | "--dereference-recursive" | "--file" | "--exclude-from"
-            ) {
-                return false;
-            }
-            let role = options::grep_value_role(name);
-            if role.is_none() && !options::safe_grep_flag(name) {
-                return false;
-            }
-            if let Some(role) = role {
-                if attached.is_empty() {
-                    pending_value = Some(role);
-                } else if unsafe_search_value(role, attached) {
-                    return false;
-                } else if matches!(role, SearchValueRole::Pattern) {
-                    pattern_supplied = true;
-                }
-            }
-            continue;
-        }
-        if options_enabled && argument.starts_with('-') && argument.len() > 1 {
-            let parsed = short_search_option(
-                argument,
-                &['r', 'R'],
-                &[
-                    ('e', SearchValueRole::Pattern),
-                    ('f', SearchValueRole::Path),
-                    ('d', SearchValueRole::DirectoryAction),
-                    ('A', SearchValueRole::Other),
-                    ('B', SearchValueRole::Other),
-                    ('C', SearchValueRole::Other),
-                    ('m', SearchValueRole::Other),
-                ],
-            );
-            let Ok((next_value, supplied_pattern)) = parsed else {
-                return false;
-            };
-            pending_value = next_value;
-            pattern_supplied |= supplied_pattern;
-            continue;
-        }
-        if pattern_supplied {
-            if sensitive_path_argument(argument) || glob_can_select_sensitive_path(argument) {
+            if unsafe_search_value(SearchValueRole::Path, argument, context)
+                && !tree::safe_recursive_target(argument, context)
+            {
                 return false;
             }
         } else {

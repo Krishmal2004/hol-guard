@@ -20,6 +20,10 @@ on:
       - scripts/prepare_extension_contribution.py
       - scripts/render_command_extension_directory.py
       - scripts/notify_merged_extension_claimants.py
+      - scripts/refresh_extension_artifacts.py
+      - scripts/intake_contribution_pr.py
+      - scripts/ci/detect_pending_extension_regen.py
+      - tests/support/extension_freshness.py
       - tests/test_guard_extension_directory*.py
       - tests/test_guard_extension_claim_notice.py
       - tests/fixtures/extension-listings/**
@@ -88,8 +92,7 @@ jobs:
         run: uv sync --frozen --extra dev --python "${{ matrix.python }}"
       - name: Build native command evaluators
         run: |
-          cargo build --manifest-path rust/Cargo.toml --locked --release -p guard-command --bin guard-command-source
-          cargo build --manifest-path rust/Cargo.toml --locked --release -p hol-guard-runtime
+          cargo build --manifest-path rust/Cargo.toml --locked --release -p guard-command -p hol-guard-runtime --bin guard-command-source --bin hol-guard-runtime
           compiler="$GITHUB_WORKSPACE/rust/target/release/guard-command-source"
           runtime="$GITHUB_WORKSPACE/rust/target/release/hol-guard-runtime"
           if [[ "$RUNNER_OS" == "Windows" ]]; then compiler="${compiler}.exe"; fi
@@ -98,6 +101,17 @@ jobs:
           echo "HOL_GUARD_NATIVE_TEST_SOURCE_COMPILER=$compiler" >> "$GITHUB_ENV"
           echo "HOL_GUARD_NATIVE_BINARY=$runtime" >> "$GITHUB_ENV"
           echo "HOL_GUARD_NATIVE_REGRESSION=1" >> "$GITHUB_ENV"
+      - name: Prepare and verify current extension projections
+        run: |
+          arguments=(--compiler "$HOL_GUARD_NATIVE_SOURCE_COMPILER")
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            arguments+=(--changed-from "${{ github.event.pull_request.base.sha }}")
+          fi
+          uv run --no-sync python scripts/ci/verify_native_command_program.py --compiler "$HOL_GUARD_NATIVE_SOURCE_COMPILER"
+          uv run --no-sync python scripts/prepare_extension_contribution.py "${arguments[@]}"
+          uv run --no-sync python scripts/render_command_extension_directory.py
+          uv run --no-sync python scripts/prepare_extension_contribution.py --check "${arguments[@]}"
+          uv run --no-sync python scripts/render_command_extension_directory.py --check
       - name: Run builder and contribution trust tests
         run: |
           mkdir -p builder-evidence
@@ -109,14 +123,6 @@ jobs:
             tests/test_guard_extension_trust.py \
             tests/test_guard_mcp_server_contribution.py \
             --junitxml=builder-evidence/tests.xml --tb=short
-      - name: Verify native public directory projections
-        run: |
-          arguments=(--check --compiler "$HOL_GUARD_NATIVE_SOURCE_COMPILER")
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            arguments+=(--changed-from "${{ github.event.pull_request.base.sha }}")
-          fi
-          uv run --no-sync python scripts/prepare_extension_contribution.py "${arguments[@]}"
-          uv run --no-sync python scripts/render_command_extension_directory.py --check
       - name: Build and install a wheel outside the checkout
         run: |
           uv build --wheel --out-dir "$RUNNER_TEMP/extension-builder-dist"

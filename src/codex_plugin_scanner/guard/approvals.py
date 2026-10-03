@@ -148,7 +148,12 @@ def build_approval_request_url(approval_center_url: str, request_id: str) -> str
     return f"{approval_center_url.rstrip('/')}/requests/{request_id.strip()}"
 
 
-def build_approval_browser_url(approval_url: str | None, *, auth_token: str | None) -> str | None:
+def build_approval_browser_url(
+    approval_url: str | None,
+    *,
+    auth_token: str | None,
+    surface: str = "approval-center",
+) -> str | None:
     """Build a browser-openable approval URL with a scoped Guard session token."""
 
     if not approval_url or auth_token is None:
@@ -162,7 +167,7 @@ def build_approval_browser_url(approval_url: str | None, *, auth_token: str | No
             "guard-token",
             build_local_dashboard_session_token(
                 auth_token=auth_token,
-                surface="approval-center",
+                surface=surface,
             ),
         )
     )
@@ -827,6 +832,27 @@ def apply_approval_resolution(
                 harness=_approval_policy_harness(request),
                 created_at=resolved_at,
             )
+
+    elif (
+        persist_policy is False
+        and scope == "artifact"
+        and exact_context_allow
+        and temporary_mcp_selection is None
+        and local_tool_selection is None
+    ):
+        # "Do not remember" still authorizes the exact approved retry once.
+        store.ensure_policy_integrity_ready_for_write(
+            harness=decision.harness,
+            approval_gate_grant=resolved_gate_grant,
+            now=resolved_at,
+        )
+        local_once_fallback = _record_local_once_approval(
+            store,
+            request_id=request_id,
+            decision=decision,
+            harness=_approval_policy_harness(request),
+            created_at=resolved_at,
+        )
 
     temporary_mcp_result: dict[str, object] | None = None
     temporary_mcp_resolved_ids: list[str] = []
@@ -1577,6 +1603,7 @@ def build_runtime_snapshot(
     active_request_id: str | None = None,
     include_items: bool = True,
     containment_health: object = None,
+    serving_runtime: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     queue_page = store.list_pending_approval_summaries(limit=1, exclude_watch_only=True)
     queue_items = queue_page["items"] if isinstance(queue_page["items"], list) else []
@@ -1602,6 +1629,14 @@ def build_runtime_snapshot(
     hook_verification = _live_hook_verification(health_managed_installs, store)
     runtime_state = store.get_runtime_state()
     health_runtime_state = dict(runtime_state) if runtime_state is not None else None
+    if health_runtime_state is None and serving_runtime is not None:
+        # The store row is gone but this process is serving requests. Report a
+        # truthful "missing registration" state instead of claiming the runtime
+        # is offline; the heartbeat writer re-registers the row.
+        health_runtime_state = dict(serving_runtime)
+        health_runtime_state["registration_status"] = "missing"
+        if approval_center_url is not None:
+            health_runtime_state["approval_center_url"] = approval_center_url
     if health_runtime_state is not None and containment_health is not None:
         health_runtime_state["containment_health"] = containment_health
     protection_health = build_runtime_protection_health(
@@ -1614,7 +1649,7 @@ def build_runtime_snapshot(
     )
     headline_state = _resolve_runtime_headline_state(
         pending_count=pending_count,
-        runtime_state=runtime_state,
+        runtime_state=health_runtime_state,
         protection_state=str(protection_health["state"]),
     )
     return {

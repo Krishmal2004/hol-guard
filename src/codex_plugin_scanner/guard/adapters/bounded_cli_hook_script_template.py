@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from .hook_http_deadline import HOOK_HTTP_DEADLINE_TEMPLATE
+from .hook_input_reader import HOOK_INPUT_READER_TEMPLATE
+
 BOUNDED_HOOK_SCRIPT_TEMPLATE = '''#!/usr/bin/env python3
 """Managed by HOL Guard. Re-run hol-guard install after moving Guard home."""
 from __future__ import annotations
+
+import time
+_HOOK_STARTED_MONOTONIC = time.monotonic()
 
 import json
 import os
 import stat
 import sys
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -19,7 +24,9 @@ from urllib.parse import quote, urlparse
 GUARD_HOME = __GUARD_HOME__
 HARNESS = __HARNESS__
 TIMEOUT_SECONDS = __TIMEOUT_SECONDS__
-_MAX_INPUT_BYTES = 1_000_000
+_HOOK_DEADLINE_MONOTONIC = _HOOK_STARTED_MONOTONIC + TIMEOUT_SECONDS
+__HOOK_INPUT_READER__
+__HOOK_HTTP_DEADLINE__
 _MAX_RESPONSE_BYTES = 1_000_000
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _DECISION_HARNESSES = frozenset({"grok", "hermes", "openclaw"})
@@ -29,6 +36,7 @@ _EVENT_ALIASES = {
     "pretooluse": "PreToolUse",
     "pretoolcall": "PreToolUse",
     "userpromptsubmit": "UserPromptSubmit",
+    "userpromptsubmitted": "UserPromptSubmit",
     "posttooluse": "PostToolUse",
 }
 _EVENT_NAME_KEYS = ("hook_event_name", "hookEventName", "event", "eventName", "hook_name", "hookName")
@@ -64,7 +72,23 @@ _APPROVAL_KEYS = (
     "guardApprovalUrl",
     "approval_requests",
 )
-_FAILURE_REASON = "HOL Guard could not complete this review before the hook deadline. Retry the action."
+_FAILURE_REASON = "HOL Guard could not complete a trusted hook decision. Retry or repair Guard from a terminal."
+_AUTHORITY_MARKER = "native command extension policy"
+_AUTHORITY_REMEDIATION = (
+    " Run `hol-guard command controls acknowledge-degraded` after reviewing the "
+    "degradation, or `hol-guard command controls recover-authority`, to restore the "
+    "protected control floor."
+)
+
+
+def _stderr_reason(reason: str) -> str:
+    if (
+        HARNESS == "zcode"
+        and _AUTHORITY_MARKER in reason
+        and "hol-guard command controls" not in reason
+    ):
+        return reason + _AUTHORITY_REMEDIATION
+    return reason
 
 
 def _assert_loopback_http_url(url: str) -> None:
@@ -193,13 +217,6 @@ def _toml_scalar(raw: str, key: str) -> str:
     return ""
 
 
-def _recording_only() -> bool:
-    raw = _read_private_text(Path(GUARD_HOME) / "config.toml", max_bytes=64 * 1024)
-    if raw is None:
-        return False
-    return _toml_scalar(raw, "protection_posture") == "watch" or _toml_scalar(raw, "mode") == "observe"
-
-
 def _approval_wait_seconds() -> float:
     raw = _read_private_text(Path(GUARD_HOME) / "config.toml", max_bytes=64 * 1024)
     configured = TIMEOUT_SECONDS
@@ -216,9 +233,13 @@ def _approval_wait_seconds() -> float:
 
 
 def _daemon_auth() -> tuple[str, int, str] | None:
+    if time.monotonic() >= _HOOK_DEADLINE_MONOTONIC:
+        return None
     raw_state = _read_private_text(Path(GUARD_HOME) / "daemon-state.json", max_bytes=64 * 1024)
+    if raw_state is None or time.monotonic() >= _HOOK_DEADLINE_MONOTONIC:
+        return None
     token = _read_private_text(Path(GUARD_HOME) / "daemon-auth-token", max_bytes=4096)
-    if raw_state is None or token is None:
+    if token is None or time.monotonic() >= _HOOK_DEADLINE_MONOTONIC:
         return None
     state = _json_object(raw_state)
     if state is None:
@@ -247,6 +268,11 @@ def _permission_decision(policy_action: str) -> str | None:
     if policy_action in {"allow", "warn"}:
         return "allow"
     if policy_action in {"review", "require-reapproval", "sandbox-required"}:
+        # zcode discards the stdout envelope when a hook exits 2, and
+        # sandbox-required keeps the blocking exit for zcode, so the envelope
+        # must say deny instead of ask to stay consistent.
+        if HARNESS == "zcode" and policy_action == "sandbox-required":
+            return "deny"
         return "ask"
     if policy_action == "block":
         return "deny"
@@ -255,11 +281,15 @@ def _permission_decision(policy_action: str) -> str | None:
 
 def _should_exit_block(event_name: str, policy_action: str) -> bool:
     compact = _compact(event_name)
-    if HARNESS in {"kimi", "grok", "hermes", "pi", "omp", "zcode"} and compact in {
-        "pretooluse",
-        "userpromptsubmit",
-        "pretoolcall",
-    }:
+    blocking_events = {"pretooluse", "userpromptsubmit", "pretoolcall"}
+    if HARNESS == "devin":
+        blocking_events.add("permissionrequest")
+    if HARNESS in {"kimi", "grok", "hermes", "pi", "omp", "zcode", "devin"} and compact in blocking_events:
+        # zcode discards stdout JSON when a hook exits 2 and denies the call,
+        # so review-tier PreToolUse decisions exit 0 for their ask envelope to
+        # reach zcode's native permission prompt.
+        if HARNESS == "zcode" and compact == "pretooluse":
+            return policy_action in {"sandbox-required", "block"}
         return policy_action in {"review", "require-reapproval", "sandbox-required", "block"}
     return False
 
@@ -274,6 +304,8 @@ def _is_permission_event(event_name: str) -> bool:
 
 def _pauses_when_unavailable(event_name: str) -> bool:
     compact = _compact(event_name)
+    if compact in {"userpromptsubmit", "userpromptsubmitted"}:
+        return HARNESS != "grok"
     if compact in _LIFECYCLE_EVENTS or compact.startswith("after"):
         return False
     return compact not in {"posttooluse", "posttool"}
@@ -319,9 +351,22 @@ def _to_native(daemon_response: dict[str, object], event_name: str) -> tuple[str
         stdout = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         return stdout, "", 2 if decision == "block" else 0
     if "hookSpecificOutput" in daemon_response or "decision" in daemon_response:
-        stdout = json.dumps(daemon_response, ensure_ascii=True, separators=(",", ":"))
-        policy = str(daemon_response.get("policy_action") or "block")
+        native_response = dict(daemon_response)
+        policy = str(native_response.get("policy_action") or "block")
         exit_code = 2 if _should_exit_block(event_name, policy) else 0
+        if HARNESS == "devin" and exit_code == 2:
+            native_response["decision"] = "block"
+            if not native_response.get("reason"):
+                native_response["reason"] = f"HOL Guard blocked this action ({policy})"
+        stdout = json.dumps(native_response, ensure_ascii=True, separators=(",", ":"))
+        if exit_code == 2 and HARNESS == "zcode":
+            reason = native_response.get("reason")
+            if not isinstance(reason, str) or not reason:
+                hook_specific = native_response.get("hookSpecificOutput")
+                reason = hook_specific.get("permissionDecisionReason") if isinstance(hook_specific, dict) else None
+            if not isinstance(reason, str) or not reason:
+                reason = f"HOL Guard blocked this action ({policy})"
+            return stdout, _stderr_reason(reason), exit_code
         return stdout, "", exit_code
     policy_action = str(daemon_response.get("policy_action") or "block")
     reason = str(daemon_response.get("reason") or daemon_response.get("permission_decision_reason") or "")
@@ -344,19 +389,41 @@ def _to_native(daemon_response: dict[str, object], event_name: str) -> tuple[str
             if permission_decision != "allow" and reason:
                 payload["reason"] = reason
             _copy_approval_metadata(daemon_response, payload)
-    stdout = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
     exit_code = 2 if _should_exit_block(event_name, policy_action) else 0
-    return stdout, reason if exit_code == 2 and HARNESS == "kimi" else "", exit_code
+    if HARNESS == "devin" and exit_code == 2:
+        payload["decision"] = "block"
+        if not payload.get("reason"):
+            payload["reason"] = reason or f"HOL Guard blocked this action ({policy_action})"
+    stdout = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    if exit_code == 2 and HARNESS in {"kimi", "devin"}:
+        return stdout, reason, exit_code
+    if exit_code == 2 and HARNESS == "zcode":
+        return stdout, _stderr_reason(reason or f"HOL Guard blocked this action ({policy_action})"), exit_code
+    return stdout, "", exit_code
 
 
 def _failure_payload(event_name: str, reason: str) -> tuple[dict[str, object], int]:
-    if _recording_only():
+    # Local configuration cannot authenticate the mode of an unavailable evaluator.
+    prompt_event = _compact(event_name) in {"userpromptsubmit", "userpromptsubmitted"}
+    if prompt_event:
+        if HARNESS == "grok":
+            return {}, 0
+        prompt_reason = "HOL Guard could not complete native prompt review safely."
         if HARNESS == "copilot":
-            return {"permissionDecision": "allow"}, 0
-        if HARNESS in _DECISION_HARNESSES:
-            return {"decision": "allow"}, 0
-        return {"hookSpecificOutput": {"hookEventName": event_name, "permissionDecision": "allow"}}, 0
+            return {"behavior": "deny", "message": prompt_reason, "interrupt": False}, 0
+        payload = {
+            "decision": "block",
+            "reason": prompt_reason,
+            "systemMessage": prompt_reason,
+            "hookSpecificOutput": {"hookEventName": "UserPromptSubmit"},
+        }
+        if HARNESS == "codex":
+            payload["continue"] = False
+            payload["stopReason"] = prompt_reason
+            payload["hookSpecificOutput"]["additionalContext"] = prompt_reason
+        return payload, 0
     if not _pauses_when_unavailable(event_name):
+        # Observations continue processing completed activity without authorizing a tool action.
         if HARNESS == "copilot":
             return {"permissionDecision": "allow"}, 0
         if HARNESS in _DECISION_HARNESSES:
@@ -388,12 +455,15 @@ def _fail(input_text: str, *, reason: str = _FAILURE_REASON) -> int:
     event_name = _event_name(input_text)
     payload, exit_code = _failure_payload(event_name, reason)
     sys.stdout.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\\n")
-    if exit_code == 2 and HARNESS in {"kimi", "zcode"}:
+    if exit_code == 2 and HARNESS in {"kimi", "zcode", "devin"}:
         print(reason, file=sys.stderr)
     return exit_code
 
 
 def _http_json(url: str, token: str, *, data: bytes | None, timeout: float) -> dict[str, object] | None:
+    deadline = min(_HOOK_DEADLINE_MONOTONIC, time.monotonic() + timeout)
+    if time.monotonic() >= deadline:
+        return None
     try:
         _assert_loopback_http_url(url)
     except ValueError:
@@ -408,6 +478,7 @@ def _http_json(url: str, token: str, *, data: bytes | None, timeout: float) -> d
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}),
             _LoopbackOnlyRedirectHandler(),
+            _deadline_http_handler(deadline),
         )
         with opener.open(request, timeout=timeout) as response:
             final_url = response.geturl()
@@ -418,7 +489,7 @@ def _http_json(url: str, token: str, *, data: bytes | None, timeout: float) -> d
             body = response.read(_MAX_RESPONSE_BYTES + 1)
     except (OSError, urllib.error.URLError, TimeoutError, ValueError):
         return None
-    if len(body) > _MAX_RESPONSE_BYTES:
+    if time.monotonic() >= deadline or len(body) > _MAX_RESPONSE_BYTES:
         return None
     try:
         text = body.decode("utf-8")
@@ -480,14 +551,16 @@ def _apply_grok_wait(input_text: str, native: tuple[str, str, int]) -> tuple[str
     wait_seconds = _approval_wait_seconds()
     if wait_seconds <= 0:
         return native
-    deadline = time.monotonic() + wait_seconds
+    deadline = min(time.monotonic() + wait_seconds, _HOOK_DEADLINE_MONOTONIC)
     resolved: dict[str, str] = {}
     while time.monotonic() < deadline and len(resolved) < len(request_ids):
         for request_id in request_ids:
             if request_id in resolved:
                 continue
             url = _loopback_url(host, port, "/v1/requests/" + quote(request_id, safe=""))
-            remaining = max(0.05, deadline - time.monotonic())
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             status = _http_json(url, token, data=None, timeout=min(remaining, 1.0))
             if status is None:
                 continue
@@ -508,12 +581,16 @@ def _apply_grok_wait(input_text: str, native: tuple[str, str, int]) -> tuple[str
 
 
 def _post_hook(input_text: str) -> tuple[str, str, int] | None:
+    if time.monotonic() >= _HOOK_DEADLINE_MONOTONIC:
+        return None
     auth = _daemon_auth()
     if auth is None:
         return None
     host, port, token = auth
     url = _loopback_url(host, port, f"/v1/hooks/{HARNESS}")
-    timeout = min(float(TIMEOUT_SECONDS) * 0.5, 5.0)
+    timeout = min(float(TIMEOUT_SECONDS) * 0.5, 5.0, _HOOK_DEADLINE_MONOTONIC - time.monotonic())
+    if timeout <= 0:
+        return None
     parsed = _http_json(url, token, data=input_text.encode("utf-8"), timeout=timeout)
     if parsed is None:
         return None
@@ -521,15 +598,17 @@ def _post_hook(input_text: str) -> tuple[str, str, int] | None:
 
 
 def main() -> int:
-    raw = sys.stdin.buffer.read(_MAX_INPUT_BYTES + 1)
-    prefix = raw[:_MAX_INPUT_BYTES].decode("utf-8", errors="replace")
-    if len(raw) > _MAX_INPUT_BYTES:
+    try:
+        prefix = _read_hook_input(_HOOK_DEADLINE_MONOTONIC)
+    except _HookInputError as error:
         return _fail(
-            prefix,
+            error.prefix,
             reason="HOL Guard blocked this action because hook input exceeded the safe size limit.",
         )
+    except (TimeoutError, OSError, ValueError):
+        return _fail("{}")
     result = _post_hook(prefix)
-    if result is None:
+    if result is None or time.monotonic() >= _HOOK_DEADLINE_MONOTONIC:
         return _fail(prefix)
     stdout, stderr, exit_code = result
     if stdout:
@@ -541,4 +620,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-'''
+'''.replace("__HOOK_INPUT_READER__", HOOK_INPUT_READER_TEMPLATE).replace(
+    "__HOOK_HTTP_DEADLINE__", HOOK_HTTP_DEADLINE_TEMPLATE
+)

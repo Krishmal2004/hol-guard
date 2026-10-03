@@ -9,6 +9,7 @@ import pytest
 
 from codex_plugin_scanner.guard import native_command_model
 from codex_plugin_scanner.guard.codex_hook_launch_runtime import BoundedHookProcessResult
+from codex_plugin_scanner.guard.daemon.hook_request_parsing import runtime_hook_event_name
 from codex_plugin_scanner.guard.native_decision_receipt import canonical_receipt_bytes
 from codex_plugin_scanner.guard.native_hook_edge import _decode_edge, review_raw_hook_native
 from codex_plugin_scanner.guard.native_resident_client import (
@@ -81,6 +82,11 @@ def _edge_result() -> dict[str, object]:
     return edge
 
 
+@pytest.mark.parametrize("alias", ("UserPromptSubmit", "userPromptSubmitted", "user_prompt_submit", "prompt"))
+def test_prompt_event_aliases_enter_one_native_authority_route(alias: str) -> None:
+    assert runtime_hook_event_name({"hook_event_name": alias}) == "UserPromptSubmit"
+
+
 def test_edge_decoder_accepts_omitted_optional_request_id() -> None:
     assert _decode_edge(_edge_result()) == _edge_result()
     with_extra = _edge_result()
@@ -98,6 +104,43 @@ def test_edge_decoder_requires_receipt_bound_to_result() -> None:
     assert isinstance(result, dict)
     result["reason_code"] = "native_other_reason"
     assert _decode_edge(mutated_result) is None
+
+
+def test_edge_decoder_accepts_only_bound_native_prompt_decision() -> None:
+    edge = _edge_result()
+    result = edge["result"]
+    receipt = edge["receipt"]
+    assert isinstance(result, dict) and isinstance(receipt, dict)
+    action = result["action"]
+    assert isinstance(action, dict)
+    edge["event_name"] = receipt["event_name"] = action["event"] = "UserPromptSubmit"
+    action.update(action_type="prompt", operation="submit", sensitive_target=True)
+    result.update(
+        decision="deny",
+        minimum_action="block",
+        policy_action="block",
+        reason_code="native_guard_bypass_prompt",
+        reason="HOL Guard blocked this prompt because it asks to disable Guard protection.",
+        explicitly_benign=False,
+        prompt_risk_classes=["local_env_read", "exfil_intent", "guard_bypass_intent"],
+    )
+    receipt.update(
+        decision="deny",
+        policy_action="block",
+        reason_code="native_guard_bypass_prompt",
+        prompt_risk_classes=["local_env_read", "exfil_intent", "guard_bypass_intent"],
+    )
+    receipt["decision_id"] = hashlib.sha256(canonical_receipt_bytes(receipt)).hexdigest()
+    assert _decode_edge(edge) == edge
+
+    wrong_action = json.loads(json.dumps(edge))
+    wrong_action["result"]["action"]["event"] = "PreToolUse"
+    assert _decode_edge(wrong_action) is None
+    wrong_classes = json.loads(json.dumps(edge))
+    wrong_classes["result"]["prompt_risk_classes"] = ["guard_bypass_intent"]
+    assert _decode_edge(wrong_classes) is None
+    wrong_kind = {**edge, "payload_kind": "source_file_ref"}
+    assert _decode_edge(wrong_kind) is None
 
 
 def test_python_launcher_only_invokes_package_bound_native_client(
@@ -348,9 +391,11 @@ def test_native_client_classifies_bounded_failure_states(
     assert native_resident_client_failure_code() == expected_code
 
 
+@pytest.mark.parametrize("request_id", [None, "request-1", "different-request"])
 def test_raw_hook_bridge_preserves_payload_for_rust_parsing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    request_id: str | None,
 ) -> None:
     runtime = tmp_path / "hol-guard-runtime"
     runtime.write_bytes(b"runtime")
@@ -408,14 +453,16 @@ def test_raw_hook_bridge_preserves_payload_for_rust_parsing(
         observe_mode=False,
         deadline=None,
         policy_snapshot={"generation": 1},
+        request_id=request_id,
     )
-    assert result == _edge_result()
+    assert result == (_edge_result() if request_id != "different-request" else None)
     encoded = captured["payload"]
     assert isinstance(encoded, bytes)
     envelope = json.loads(encoded)
     assert envelope["raw_payload"] == raw_payload
     assert envelope["harness"] == "claude"
     assert envelope["event"] == "PreToolUse"
+    assert envelope["request_id"] == request_id
     assert captured["raw_hook_envelope"] is True
 
     for invalid_value in ({"not", "json"}, float("nan")):

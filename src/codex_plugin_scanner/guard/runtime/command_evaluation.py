@@ -375,13 +375,11 @@ def evaluate_command(
             and (evidence.identity.rule_id not in explicitly_enabled_rule_ids or evidence.uncertainty_reasons)
         )
     )
-    # Keep read floors whenever the native result is non-benign or execution
-    # still needs a separate filesystem/launch proof.
-    read_factors = (
-        ()
-        if native_host_floor_exempt
-        else shell_read_floor_factors(command_text, command.security_identity, cwd=cwd, home_dir=home_dir)
-    )
+    # A native benign proof cannot establish the resolved target of a file
+    # read, so secret-read floors remain active even for proven benign commands.
+    read_factors = shell_read_floor_factors(command_text, command.security_identity, cwd=cwd, home_dir=home_dir)
+    if native_host_floor_exempt:
+        read_factors = tuple(factor for factor in read_factors if factor.reason_code == "critical.local-secret-read")
     if authorization_evidence is not None:
         # Claimed workflow proof already covers exact GitHub CLI execution.
         # Keep secret-read floors; do not let a script-shaped interpreter
@@ -456,8 +454,16 @@ def evaluate_command(
     native_classification_factors = _native_classification_factors(
         native_extension_evidence, command, allow_benign_proof=not execution_proof_required
     )
+    # Authenticated consent is evidence for the current decision, not proof
+    # that the same command is benign without the control layer.
+    baseline_native_factors = (
+        ()
+        if isinstance(native_extension_evidence, dict)
+        and native_extension_evidence.get("reason_code") == "native_command_explicit_permission_allow"
+        else native_classification_factors
+    )
     baseline_factors = (
-        *native_classification_factors,
+        *baseline_native_factors,
         *baseline_decision_factors,
         *((contained_routine_candidate,) if contained_routine_candidate is not None else ()),
         *((verified_read_candidate,) if verified_read_candidate is not None else ()),

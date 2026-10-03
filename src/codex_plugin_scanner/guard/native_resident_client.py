@@ -20,6 +20,7 @@ from .codex_hook_launch_runtime import (
 from .codex_hook_launch_runtime import (
     run_isolated_hook_process as _legacy_run_isolated_hook_process,
 )
+from .fork_safety import forget_in_child
 from .native_approval_errors import NATIVE_RESIDENT_LIFECYCLE_ERROR_CODES
 from .native_resident_stream import _PersistentNativeClient, _StreamFailure
 
@@ -38,6 +39,7 @@ _LAST_FAILURE_CODE: ContextVar[str | None] = ContextVar(
 )
 _RESIDENTS_LOCK = threading.Lock()
 _RESIDENTS: dict[tuple[Path, Path], Mapping[str, str]] = {}
+forget_in_child(_RESIDENTS)
 
 
 def native_resident_client_failure_code() -> str | None:
@@ -135,23 +137,38 @@ class _PersistentNativeClientPool:
                     self._idle.append(client)
                 self._condition.notify()
             if close_client:
-                client.close()
+                try:
+                    contained = client.close(deadline_monotonic=deadline_monotonic)
+                except BaseException:
+                    with self._condition:
+                        self._clients.add(client)
+                    raise
+                if contained is False:
+                    with self._condition:
+                        self._clients.add(client)
 
-    def close(self) -> None:
+    def close(self, *, deadline_monotonic: float | None = None) -> bool:
         with self._condition:
             self._closed = True
             clients = tuple(self._clients)
-            self._clients.clear()
             self._idle.clear()
             self._condition.notify_all()
         for client in clients:
-            client.close()
+            contained = (
+                client.close() if deadline_monotonic is None else client.close(deadline_monotonic=deadline_monotonic)
+            )
+            if contained is not False:
+                with self._condition:
+                    self._clients.discard(client)
         for client in clients:
             _contain_persistent_resident(client)
+        with self._condition:
+            return not self._clients
 
 
 _CLIENTS_LOCK = threading.Lock()
 _CLIENT_POOLS: dict[tuple[str, str], _PersistentNativeClientPool] = {}
+forget_in_child(_CLIENT_POOLS)
 
 
 def _client_pool_for(executable: Path, state_dir: Path, environment: Mapping[str, str]) -> _PersistentNativeClientPool:
@@ -193,7 +210,7 @@ def _contain_persistent_resident(client: _PersistentNativeClient) -> None:
     _ = client
 
 
-def close_native_resident_clients(guard_home: Path | None = None) -> None:
+def close_native_resident_clients(guard_home: Path | None = None, *, deadline_monotonic: float | None = None) -> bool:
     """Close persistent Rust clients, optionally limited to one Guard home."""
 
     resolved_guard_home = guard_home.expanduser().resolve() if guard_home is not None else None
@@ -204,17 +221,25 @@ def close_native_resident_clients(guard_home: Path | None = None) -> None:
             for key, pool in _CLIENT_POOLS.items()
             if resolved_guard_home is None or Path(key[1]).parent == resolved_guard_home
         ]
-        for key, _pool in selected:
-            _CLIENT_POOLS.pop(key, None)
     first_error: Exception | None = None
-    for _key, pool in selected:
+    all_contained = True
+    for key, pool in selected:
         try:
-            pool.close()
+            contained = (
+                pool.close() if deadline_monotonic is None else pool.close(deadline_monotonic=deadline_monotonic)
+            )
+            if contained is False:
+                all_contained = False
+            else:
+                with _CLIENTS_LOCK:
+                    if _CLIENT_POOLS.get(key) is pool:
+                        _CLIENT_POOLS.pop(key)
         except Exception as error:
             if first_error is None:
                 first_error = error
     if first_error is not None:
         raise first_error
+    return all_contained
 
 
 atexit.register(close_native_resident_clients)
@@ -233,6 +258,7 @@ def stop_native_resident(
     state_dir: Path,
     environment: Mapping[str, str],
     timeout_seconds: float = 3.0,
+    deadline_monotonic: float | None = None,
 ) -> bool:
     """Stop one Rust-managed resident and wait for its state retirement."""
     result = run_isolated_hook_process(
@@ -241,6 +267,7 @@ def stop_native_resident(
         cwd=executable.parent,
         environment=dict(environment),
         timeout_seconds=timeout_seconds,
+        deadline_monotonic=deadline_monotonic,
         output_limit=_MAX_RESPONSE_BYTES,
     )
     return (
@@ -251,11 +278,15 @@ def stop_native_resident(
     )
 
 
-def close_native_residents(guard_home: Path | None = None) -> bool:
+def close_native_residents(guard_home: Path | None = None, *, deadline_monotonic: float | None = None) -> bool:
     """Stop this process's residents, optionally limited to one Guard home."""
 
     resolved_guard_home = guard_home.expanduser().resolve() if guard_home is not None else None
-    close_native_resident_clients(guard_home)
+    clients_contained = (
+        close_native_resident_clients(guard_home)
+        if deadline_monotonic is None
+        else close_native_resident_clients(guard_home, deadline_monotonic=deadline_monotonic)
+    )
     with _RESIDENTS_LOCK:
         residents = [
             (key, environment)
@@ -267,13 +298,19 @@ def close_native_residents(guard_home: Path | None = None) -> bool:
             for key, environment in _RESIDENTS.items()
             if resolved_guard_home is not None and key[1].parent != resolved_guard_home
         }
-    all_contained = True
+    all_contained = clients_contained is not False
     for (executable, state_dir), environment in residents:
-        if _state_files(state_dir) and not stop_native_resident(
+        if not _state_files(state_dir):
+            continue
+        remaining_seconds = 3.0 if deadline_monotonic is None else min(3.0, deadline_monotonic - time.monotonic())
+        stopped = remaining_seconds > 0 and stop_native_resident(
             executable=executable,
             state_dir=state_dir,
             environment=environment,
-        ):
+            timeout_seconds=remaining_seconds,
+            deadline_monotonic=deadline_monotonic,
+        )
+        if not stopped:
             remaining[(executable, state_dir)] = environment
             all_contained = False
     with _RESIDENTS_LOCK:

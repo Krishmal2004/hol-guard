@@ -10,13 +10,16 @@ from pathlib import Path
 import pytest
 import yaml
 
+from tests.support.ci_workflow import expand_ci_job_actions
+
 ROOT = Path(__file__).resolve().parents[1]
 PREPARE_SCRIPT = ROOT / "scripts/ci/prepare_sonar_analysis.sh"
 SETUP_SCRIPT = ROOT / "scripts/ci/setup_sonar_rust.sh"
 
 
 def test_sonar_preparation_precedes_analysis_and_fails_closed() -> None:
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    """Verify sonar preparation precedes analysis and fails closed."""
+    workflow = expand_ci_job_actions(yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")))
     job = workflow["jobs"]["sonar"]
     steps = job["steps"]
     download_index = next(i for i, step in enumerate(steps) if step.get("name") == "Download pytest coverage data")
@@ -35,7 +38,8 @@ def test_sonar_preparation_precedes_analysis_and_fails_closed() -> None:
     clippy = "cargo clippy --manifest-path rust/Cargo.toml --locked --workspace"
 
     assert job["timeout-minutes"] == 20
-    assert job["needs"] == ["sonar-guard"]
+    assert "needs" not in job
+    assert steps[0]["id"] == "token-presence"
     assert job["permissions"] == {"contents": "read", "actions": "read"}
     assert wait_index < download_index < setup_index < scan_index
     assert "wait_for_pytest_shards.py" in steps[wait_index]["run"]
@@ -46,7 +50,7 @@ def test_sonar_preparation_precedes_analysis_and_fails_closed() -> None:
     assert steps[clippy_index]["run"] == clippy
     assert steps[clippy_index]["shell"] == "bash"
     assert not steps[clippy_index].get("continue-on-error", False)
-    assert "if" not in steps[clippy_index]
+    assert steps[clippy_index]["if"] == "steps.token-presence.outputs.has-token == 'true'"
     assert steps[clippy_index].get("env", {}) == {}
     assert "SONAR_TOKEN" not in job.get("env", {})
     assert "SONAR_TOKEN" not in workflow.get("env", {})
@@ -104,7 +108,7 @@ def _run_preparation(
 
 
 def test_preparation_combines_all_shards_before_creating_coverage_xml(tmp_path: Path) -> None:
-    result, commands = _run_preparation(tmp_path, 192)
+    result, commands = _run_preparation(tmp_path, 128)
     assert result.returncode == 0, result.stderr
     assert len(commands) == 2
     assert commands[0].split() == [
@@ -115,14 +119,15 @@ def test_preparation_combines_all_shards_before_creating_coverage_xml(tmp_path: 
         "scripts/ci/parallel_coverage_combine.py",
         "--workers",
         "4",
-        *sorted(f"coverage-data/shard-{shard:02d}/.coverage" for shard in range(192)),
+        *sorted(f"coverage-data/shard-{shard:02d}/.coverage" for shard in range(128)),
     ]
     assert commands[1] == "uv run --no-sync python scripts/ci/parallel_coverage_xml.py --workers 4"
 
 
 @pytest.mark.parametrize("fail_command", ["", "cargo clippy"])
 def test_early_clippy_runs_without_coverage_and_propagates_failure(tmp_path: Path, fail_command: str) -> None:
-    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    """Verify early clippy runs without coverage and propagates failure."""
+    workflow = expand_ci_job_actions(yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")))
     step = next(
         step
         for step in workflow["jobs"]["sonar"]["steps"]
@@ -147,7 +152,7 @@ def test_setup_initializes_pinned_toolchain_before_cache(tmp_path: Path) -> None
     ]
 
 
-@pytest.mark.parametrize("shard_count", [0, 128, 191, 193])
+@pytest.mark.parametrize("shard_count", [0, 64, 127, 129])
 def test_preparation_rejects_incomplete_or_excess_coverage_before_running_tools(
     tmp_path: Path, shard_count: int
 ) -> None:
@@ -164,7 +169,7 @@ def test_preparation_rejects_incomplete_or_excess_coverage_before_running_tools(
     ],
 )
 def test_preparation_stops_at_each_failed_command(tmp_path: Path, failed_command: str) -> None:
-    result, commands = _run_preparation(tmp_path, 192, failed_command)
+    result, commands = _run_preparation(tmp_path, 128, failed_command)
     assert result.returncode == 7
     assert commands[-1].startswith(failed_command)
 
