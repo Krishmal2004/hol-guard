@@ -14,12 +14,15 @@ A file is skipped only when all of these hold:
 - it is a regular file inside the plugin, not a symlink;
 - its headers identify a Mach-O executable, dylib or bundle (thin or universal, 32 or
   64-bit, either byte order), the load commands parse exactly, and the segments and
-  code-signature data account for every byte of the file or slice.
+  code-signature data declare continuous coverage of every byte of each slice.
+  Universal slices may have zero-filled alignment padding of at most 64 KiB per gap;
+  alignments above 64 KiB are conservatively rejected.
 
-Recognition reads headers only and ignores the file name and extension. A file with
-a binary header followed by other bytes, a truncated or malformed header, a renamed
-large text file, or any other oversized file is **not** skipped. It still stops the
-scan with `SCAN_RESOURCE_BUDGET_EXCEEDED`, as before.
+Recognition reads bounded headers and alignment padding and ignores the file name
+and extension. Truncated or malformed headers, undeclared bytes after the image,
+gaps within a slice, nonzero universal padding, and oversized text without recognized
+headers still stop the scan with `SCAN_RESOURCE_BUDGET_EXCEEDED`. Header declarations
+can be forged: text inside declared binary regions is not inspected either.
 
 ## What stays covered
 
@@ -32,8 +35,8 @@ When binaries are skipped, the "No hardcoded secrets" message says so.
 
 The scanner makes no claim about a skipped binary: not that it is free of secrets,
 malware or network behavior, not that it matches any source, and not that it is safe
-because it is signed. A code signature is reported as context only: it shows who
-signed the file, not what the file does. Smaller binaries and executables in other
+because it is signed. A code-signature load command is reported as context only;
+the signature and signer are not verified. Smaller binaries and executables in other
 formats (ELF, PE, scripts without extensions) are read as text, as before.
 Executables built by tools that append a payload after the Mach-O image are not
 recognized, because the appended bytes cannot be accounted for.

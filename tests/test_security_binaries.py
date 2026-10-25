@@ -20,7 +20,7 @@ from codex_plugin_scanner.checks.security import (
 from codex_plugin_scanner.checks.security_binaries import inspect_packaged_binary
 
 OVER_LIMIT = MAX_SCAN_FILE_BYTES + 1024
-SECRET_LINE = 'const token = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";\n'
+SECRET_LINE = 'const token = "sk-proj-' + 'abcdefghijklmnopqrstuvwxyz0123456789";\n'
 MAGICS = {
     (False, True): b"\xcf\xfa\xed\xfe",
     (False, False): b"\xce\xfa\xed\xfe",
@@ -47,7 +47,7 @@ def _thin(total: int, *, signed: bool = True, big_endian: bool = False, wide: bo
     return body + b"\x00" * (total - len(body))
 
 
-def _fat(slices: list[bytes], *, wide: bool = False) -> bytes:
+def _fat(slices: list[bytes], *, wide: bool = False, swapped: bool = False) -> bytes:
     entry_size = 32 if wide else 20
     head_size = 8 + entry_size * len(slices)
     offsets = []
@@ -56,12 +56,14 @@ def _fat(slices: list[bytes], *, wide: bool = False) -> bytes:
         cursor = (cursor + 0xFFF) & ~0xFFF
         offsets.append(cursor)
         cursor += len(data)
-    out = bytearray((b"\xca\xfe\xba\xbf" if wide else b"\xca\xfe\xba\xbe") + struct.pack(">I", len(slices)))
+    order = "<" if swapped else ">"
+    magic = b"\xca\xfe\xba\xbf" if wide else b"\xca\xfe\xba\xbe"
+    out = bytearray((magic[::-1] if swapped else magic) + struct.pack(f"{order}I", len(slices)))
     for offset, data in zip(offsets, slices, strict=True):
         if wide:
-            out += struct.pack(">2I2Q2I", 0x0100000C, 0, offset, len(data), 12, 0)
+            out += struct.pack(f"{order}2I2Q2I", 0x0100000C, 0, offset, len(data), 12, 0)
         else:
-            out += struct.pack(">5I", 0x0100000C, 0, offset, len(data), 12)
+            out += struct.pack(f"{order}5I", 0x0100000C, 0, offset, len(data), 12)
     for offset, data in zip(offsets, slices, strict=True):
         out += b"\x00" * (offset - len(out))
         out += data
@@ -96,12 +98,49 @@ class TestRecognition:
         assert binary.code_signature_present is False
 
     @pytest.mark.parametrize("wide", [False, True])
-    def test_recognizes_universal(self, tmp_path: Path, wide: bool):
-        path = _write_binary(tmp_path / "tool", _fat([_thin(8192), _thin(12288)], wide=wide))
+    @pytest.mark.parametrize("swapped", [False, True])
+    def test_recognizes_universal(self, tmp_path: Path, wide: bool, swapped: bool):
+        path = _write_binary(tmp_path / "tool", _fat([_thin(8192), _thin(12288)], wide=wide, swapped=swapped))
         binary = inspect_packaged_binary(path)
         assert binary is not None
         assert binary.format == "mach-o-universal"
         assert binary.architectures == 2
+
+    @pytest.mark.parametrize("before_segment", [False, True])
+    def test_uncovered_thin_text_fails_closed(self, tmp_path: Path, before_segment: bool):
+        root = _plugin(tmp_path)
+        data = bytearray(_thin(OVER_LIMIT))
+        # Keep an EOF signature, but leave the secret outside all declared ranges.
+        offset, size = (4096, OVER_LIMIT - 4096) if before_segment else (0, 4096)
+        struct.pack_into("<2Q", data, 32 + 40, offset, size)
+        position = 1024 if before_segment else 8192
+        data[position : position + len(SECRET_LINE)] = SECRET_LINE.encode()
+        path = _write_binary(root / "tool", data)
+        assert inspect_packaged_binary(path) is None
+        assert check_no_hardcoded_secrets(root).findings[0].rule_id == "SCAN_RESOURCE_BUDGET_EXCEEDED"
+
+    @pytest.mark.parametrize("between_slices", [False, True])
+    def test_universal_padding_cannot_hide_text(self, tmp_path: Path, between_slices: bool):
+        root = _plugin(tmp_path)
+        data = bytearray(_fat([_thin(OVER_LIMIT + 1), _thin(8192)]))
+        first_offset, first_size = struct.unpack_from(">2I", data, 16)
+        position = first_offset + first_size if between_slices else 128
+        data[position : position + len(SECRET_LINE)] = SECRET_LINE.encode()
+        path = _write_binary(root / "tool", data)
+        assert inspect_packaged_binary(path) is None
+        assert check_no_hardcoded_secrets(root).findings[0].rule_id == "SCAN_RESOURCE_BUDGET_EXCEEDED"
+
+    def test_rejects_oversized_universal_gap(self, tmp_path: Path):
+        data = bytearray(_fat([_thin(8192)]))
+        data[4096:4096] = b"\x00" * OVER_LIMIT
+        struct.pack_into(">I", data, 16, 4096 + OVER_LIMIT)
+        assert inspect_packaged_binary(_write_binary(tmp_path / "tool", data)) is None
+
+    def test_rejects_truncated_segment_command(self, tmp_path: Path):
+        data = bytearray(_thin(8192))
+        # A second, malformed segment cannot be ignored merely because the first covers EOF.
+        struct.pack_into("<2I", data, 104, 0x19, 16)
+        assert inspect_packaged_binary(_write_binary(tmp_path / "tool", data)) is None
 
     def test_rejects_truncated_and_malformed(self, tmp_path: Path):
         good = _thin(8192)
@@ -136,6 +175,31 @@ class TestRecognition:
 
 
 class TestScanning:
+    def test_security_checks_do_not_add_a_third_binary_inspection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        root = _plugin(tmp_path)
+        _write_binary(root / "tool", _thin(OVER_LIMIT))
+        inspect = security.inspect_packaged_binary
+        calls = []
+
+        def counted(path):
+            calls.append(path)
+            return inspect(path)
+
+        monkeypatch.setattr(security, "inspect_packaged_binary", counted)
+        results = run_security_checks(root)
+        assert any(c.name == "Packaged binaries not inspected" for c in results)
+        assert len(calls) == 2
+
+    def test_failed_scan_does_not_claim_other_files_were_scanned(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        root = _plugin(tmp_path)
+        _write_binary(root / "a-tool", _thin(OVER_LIMIT))
+        (root / "z-large-text").write_bytes(b"a" * OVER_LIMIT)
+        results = run_security_checks(root)
+        assert any(f.rule_id == "SCAN_RESOURCE_BUDGET_EXCEEDED" for c in results for f in c.findings)
+        assert all(c.name != "Packaged binaries not inspected" for c in results)
+
     def test_extensionless_binary_over_limit_is_skipped_and_reported(self, tmp_path: Path):
         root = _plugin(tmp_path)
         _write_binary(root / "binary" / "tool-darwin-arm64", _thin(OVER_LIMIT))
@@ -240,3 +304,18 @@ def test_published_action_scan_path_reports_skipped_binary(tmp_path: Path):
     assert "UNINSPECTED_PACKAGED_BINARY" in rule_ids
     assert "HARDCODED_SECRET" in rule_ids
     assert "SCAN_RESOURCE_BUDGET_EXCEEDED" not in rule_ids
+
+
+@pytest.mark.parametrize("as_argument", [False, True])
+def test_kimi_scan_reports_declared_uninspected_binary(tmp_path: Path, as_argument: bool):
+    from codex_plugin_scanner.models import ScanOptions
+    from codex_plugin_scanner.scanner import scan_plugin
+
+    root = _plugin(tmp_path)
+    server = {"command": "node", "args": ["./tool"]} if as_argument else {"command": "./tool"}
+    (root / "kimi.plugin.json").write_text(
+        json.dumps({"name": "demo", "mcpServers": {"local": server}}), encoding="utf-8"
+    )
+    _write_binary(root / "tool", _thin(OVER_LIMIT))
+    result = scan_plugin(root, ScanOptions(ecosystem="kimi", cisco_skill_scan="off", cisco_mcp_scan="off"))
+    assert any(f.rule_id == "UNINSPECTED_PACKAGED_BINARY" and f.file_path == "tool" for f in result.findings)

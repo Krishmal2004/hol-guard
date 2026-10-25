@@ -1,6 +1,6 @@
 """Bounded recognition of packaged Mach-O executables that the text scanner cannot read.
 
-Recognition reads file headers only and never trusts a name or a magic number alone:
+Recognition reads bounded headers and padding and never trusts a name or a magic number alone:
 a file is a packaged binary only when its headers and load commands are structurally
 consistent with the whole file. Recognition is not an assessment of safety. Code
 signing is recorded as context and never lowers a finding.
@@ -20,6 +20,7 @@ from ..models import CheckResult, Finding, Severity
 MAX_FAT_ARCHES = 16
 MAX_LOAD_COMMANDS = 4096
 MAX_LOAD_COMMAND_BYTES = 256 * 1024
+MAX_FAT_PADDING_BYTES = 64 * 1024
 
 _THIN_MAGICS = {
     b"\xfe\xed\xfa\xce": (">", False),
@@ -27,8 +28,12 @@ _THIN_MAGICS = {
     b"\xfe\xed\xfa\xcf": (">", True),
     b"\xcf\xfa\xed\xfe": ("<", True),
 }
-_FAT_MAGIC = b"\xca\xfe\xba\xbe"
-_FAT64_MAGIC = b"\xca\xfe\xba\xbf"
+_FAT_MAGICS = {
+    b"\xca\xfe\xba\xbe": (">", False),
+    b"\xbe\xba\xfe\xca": ("<", False),
+    b"\xca\xfe\xba\xbf": (">", True),
+    b"\xbf\xba\xfe\xca": ("<", True),
+}
 _SUPPORTED_FILE_TYPES = {2, 6, 8}  # MH_EXECUTE, MH_DYLIB, MH_BUNDLE
 _LC_SEGMENT = 0x1
 _LC_SEGMENT_64 = 0x19
@@ -82,7 +87,7 @@ def _inspect_thin(handle: BinaryIO, base: int, length: int) -> bool | None:
         return None
 
     cursor = 0
-    covered_end = 0
+    ranges = [(0, header_size + sizeofcmds)]
     segments = 0
     signed = False
     alignment = 8 if is_64 else 4
@@ -92,11 +97,23 @@ def _inspect_thin(handle: BinaryIO, base: int, length: int) -> bool | None:
         command, command_size = struct.unpack_from(f"{order}2I", commands, cursor)
         if command_size < 8 or command_size % alignment or cursor + command_size > sizeofcmds:
             return None
-        if command == _LC_SEGMENT_64 and command_size >= 72:
+        if command == _LC_SEGMENT_64:
+            if not is_64 or command_size < 72:
+                return None
+            (sections,) = struct.unpack_from(f"{order}I", commands, cursor + 64)
+            if command_size != 72 + sections * 80:
+                return None
             file_offset, file_size = struct.unpack_from(f"{order}2Q", commands, cursor + 40)
-        elif command == _LC_SEGMENT and command_size >= 56:
+        elif command == _LC_SEGMENT:
+            if is_64 or command_size < 56:
+                return None
+            (sections,) = struct.unpack_from(f"{order}I", commands, cursor + 48)
+            if command_size != 56 + sections * 68:
+                return None
             file_offset, file_size = struct.unpack_from(f"{order}2I", commands, cursor + 32)
-        elif command == _LC_CODE_SIGNATURE and command_size >= 16:
+        elif command == _LC_CODE_SIGNATURE:
+            if command_size != 16:
+                return None
             file_offset, file_size = struct.unpack_from(f"{order}2I", commands, cursor + 8)
             signed = signed or file_size > 0
         else:
@@ -106,42 +123,59 @@ def _inspect_thin(handle: BinaryIO, base: int, length: int) -> bool | None:
             segments += 1
         if file_offset + file_size > length:
             return None
-        covered_end = max(covered_end, file_offset + file_size)
+        if file_size:
+            ranges.append((file_offset, file_offset + file_size))
         cursor += command_size
     if cursor != sizeofcmds or segments == 0:
         return None
-    # Bytes after the last segment or signature are unaccounted for: a text or archive
-    # payload behind a valid header is not a packaged binary, so it keeps failing closed.
+    # The declarations must cover the entire slice, including gaps between regions.
+    # These declarations are untrusted and establish no assurance about the contents.
+    covered_end = 0
+    for start, end in sorted(ranges):
+        if start > covered_end:
+            return None
+        covered_end = max(covered_end, end)
     if covered_end != length:
         return None
     return signed
 
 
-def _inspect_fat(handle: BinaryIO, length: int, *, wide: bool) -> PackagedBinary | None:
+def _inspect_fat(handle: BinaryIO, length: int, *, order: str, wide: bool) -> PackagedBinary | None:
     header = _read_exact(handle, 0, 8)
     if header is None:
         return None
-    (count,) = struct.unpack(">I", header[4:8])
+    (count,) = struct.unpack(f"{order}I", header[4:8])
     if not 0 < count <= MAX_FAT_ARCHES:
         return None
     entry_size = 32 if wide else 20
     table = _read_exact(handle, 8, count * entry_size)
     if table is None:
         return None
-    slices: list[tuple[int, int]] = []
+    slices: list[tuple[int, int, int]] = []
     for index in range(count):
         entry = table[index * entry_size : (index + 1) * entry_size]
         if wide:
-            offset, size = struct.unpack(">QQ", entry[8:24])
+            offset, size, alignment, reserved = struct.unpack(f"{order}QQII", entry[8:32])
+            if reserved:
+                return None
         else:
-            offset, size = struct.unpack(">II", entry[8:16])
-        slices.append((offset, size))
+            offset, size, alignment = struct.unpack(f"{order}III", entry[8:20])
+        if alignment > 16 or offset % (1 << alignment):
+            return None
+        slices.append((offset, size, alignment))
     slices.sort()
     floor = 8 + count * entry_size
     signed_slices = 0
-    for offset, size in slices:
+    for offset, size, alignment in slices:
         if size == 0 or offset < floor or offset + size > length:
             return None
+        gap = offset - floor
+        if gap >= (1 << alignment) or gap > MAX_FAT_PADDING_BYTES:
+            return None
+        if gap:
+            padding = _read_exact(handle, floor, gap)
+            if padding is None or any(padding):
+                return None
         signed = _inspect_thin(handle, offset, size)
         if signed is None:
             return None
@@ -153,7 +187,7 @@ def _inspect_fat(handle: BinaryIO, length: int, *, wide: bool) -> PackagedBinary
 
 
 def inspect_packaged_binary(path: Path) -> PackagedBinary | None:
-    """Recognize a thin or universal Mach-O by reading its headers; never reads the whole file."""
+    """Recognize a thin or universal Mach-O from bounded headers and alignment padding."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         before = path.lstat()
@@ -169,10 +203,10 @@ def inspect_packaged_binary(path: Path) -> PackagedBinary | None:
         length = opened.st_size
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
             magic = _read_exact(handle, 0, 4)
-            if magic == _FAT_MAGIC:
-                return _inspect_fat(handle, length, wide=False)
-            if magic == _FAT64_MAGIC:
-                return _inspect_fat(handle, length, wide=True)
+            fat_layout = _FAT_MAGICS.get(magic or b"")
+            if fat_layout is not None:
+                order, wide = fat_layout
+                return _inspect_fat(handle, length, order=order, wide=wide)
             signed = _inspect_thin(handle, 0, length)
             if signed is None:
                 return None
@@ -189,9 +223,9 @@ def uninspected_binary_check(root: Path, binaries: list[UninspectedBinary]) -> C
     for item in sorted(binaries, key=lambda entry: entry.path):
         relative = item.path.relative_to(root).as_posix()
         signature = (
-            "has a code signature (context only, not evidence of safety)"
+            "declares code-signature data (not verified and not evidence of safety)"
             if (item.binary.code_signature_present)
-            else "has no complete code signature"
+            else "does not declare code-signature data in every slice"
         )
         findings.append(
             Finding(

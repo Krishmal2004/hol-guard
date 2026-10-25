@@ -730,11 +730,13 @@ def check_license(plugin_dir: Path) -> CheckResult:
 
 
 def _check_no_hardcoded_secrets(
-    plugin_dir: Path, files: tuple[Path, ...] | None, runtime_findings: list[Finding]
+    plugin_dir: Path,
+    files: tuple[Path, ...] | None,
+    runtime_findings: list[Finding],
+    uninspected: list[UninspectedBinary],
 ) -> CheckResult:
     findings: list[tuple[str, int]] = []
     resolved_plugin_dir = plugin_dir.resolve()
-    uninspected: list[UninspectedBinary] = []
     try:
         for fpath in _scan_all_files(resolved_plugin_dir, files, uninspected):
             relative_path = fpath.relative_to(resolved_plugin_dir)
@@ -799,11 +801,19 @@ def _check_no_hardcoded_secrets(
     )
 
 
-def check_credential_access(plugin_dir: Path, files: tuple[Path, ...] | None = None) -> tuple[CheckResult, CheckResult]:
+def check_credential_access(
+    plugin_dir: Path,
+    files: tuple[Path, ...] | None = None,
+    *,
+    uninspected: list[UninspectedBinary] | None = None,
+) -> tuple[CheckResult, CheckResult]:
     """Scan once and keep literal scoring separate from advisory capabilities."""
     runtime_findings: list[Finding] = []
-    literal_check = _check_no_hardcoded_secrets(plugin_dir, files, runtime_findings)
+    skipped = uninspected if uninspected is not None else []
+    literal_check = _check_no_hardcoded_secrets(plugin_dir, files, runtime_findings, skipped)
     complete = all(finding.rule_id == "HARDCODED_SECRET" for finding in literal_check.findings)
+    if not complete:
+        skipped.clear()
     message = (
         "Runtime credential access requires review"
         if runtime_findings
@@ -1288,13 +1298,14 @@ def check_uninspected_binaries(plugin_dir: Path, files: tuple[Path, ...] | None 
 
 def run_security_checks(plugin_dir: Path, *, instruction_files: tuple[Path, ...] = ()) -> tuple[CheckResult, ...]:
     """Run the security checks; ``instruction_files`` are read as agent instructions by the approval check."""
-    binaries_check = check_uninspected_binaries(plugin_dir)
+    uninspected: list[UninspectedBinary] = []
+    credential_checks = check_credential_access(plugin_dir, uninspected=uninspected)
     return (
         check_security_md(plugin_dir),
         check_license(plugin_dir),
-        *check_credential_access(plugin_dir),
+        *credential_checks,
         check_no_dangerous_mcp(plugin_dir),
         check_mcp_transport_security(plugin_dir),
         check_no_approval_bypass_defaults(plugin_dir, instruction_files=instruction_files),
-        *((binaries_check,) if binaries_check is not None else ()),
+        *((uninspected_binary_check(plugin_dir.resolve(), uninspected),) if uninspected else ()),
     )
